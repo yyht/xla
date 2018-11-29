@@ -5,14 +5,16 @@ set -e
 # Display commands being run.
 set -x
 
+ls -lah
+
 # Pack tarball artifact with source
 mkdir wheels_source
-tar -czvf pytorch-tpu-nightly.tar.gz git/xla
+tar -czvf pytorch-tpu-nightly.tar.gz github/xla
 cp pytorch-tpu-nightly.tar.gz wheels_source
 cp pytorch-tpu-nightly.tar.gz wheels_source/"pytorch-tpu-$(date -d "yesterday" +%Y%m%d).tar.gz"
 
 # Place pytorch/xla under pytorch/pytorch
-cd git
+cd github
 git clone https://github.com/pytorch/pytorch.git
 mv xla/ pytorch/
 cd pytorch
