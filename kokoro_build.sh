@@ -56,8 +56,7 @@ conda install -y -c mingfeima mkldnn
 
 # Install torch within conda env
 # TODO(jysohn): once pytorch/pytorch JIT bug is fixed install nightly wheel instead
-gsutil cp gs://pytorch-tpu-releases/torch_patch_wheel/torch-1.0.0a0+1ca0ec7-cp35-cp35m-linux_x86_64.whl /tmp/.
-pip install /tmp/torch-1.0.0a0+1ca0ec7-cp35-cp35m-linux_x86_64.whl
+pip install ../../../gfile/torch-1.0.0a0+1ca0ec7-cp35-cp35m-linux_x86_64.whl
 
 # Build pytorch-wheel in conda environment
 export NO_CUDA=1

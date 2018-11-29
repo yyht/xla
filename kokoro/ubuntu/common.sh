@@ -1,11 +1,12 @@
 !/bin/bash
 
+ls -lah
+ls -lah gfile
+
 # Fail on any error.
 set -e
 # Display commands being run.
 set -x
-
-ls -lah
 
 # Pack tarball artifact with source
 mkdir wheels_source
