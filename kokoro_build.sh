@@ -57,7 +57,7 @@ conda install -y -c mingfeima mkldnn
 # Install torch within conda env
 # TODO(jysohn): once pytorch/pytorch JIT bug is fixed install nightly wheel instead
 sudo find / -iname ldconfig
-sudo /sbin/ldconfig "${HOME}/anaconda3/lib/"
+sudo /sbin/ldconfig "${HOME}/anaconda3/lib/" "${HOME}/anaconda3/envs/pytorch/lib"
 pip install ../../../gfile/torch-1.0.0a0+1ca0ec7-cp35-cp35m-linux_x86_64.whl
 
 # Build pytorch-wheel in conda environment
