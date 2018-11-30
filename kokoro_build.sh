@@ -5,6 +5,21 @@ set -e
 # Display commands being run.
 set -x
 
+# Update compilers to use gcc/g++/cpp-6 as default
+sudo apt-get update
+sudo apt-get install -y gcc-6
+sudo apt-get install -y g++-6
+sudo apt-get install -y cpp-6
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.8 20 --slave /usr/bin/g++ g++ /usr/bin/g++-4.8
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-6 10 --slave /usr/bin/g++ g++ /usr/bin/g++-6
+sudo update-alternatives --install /usr/bin/cpp cpp /usr/bin/cpp-6 10
+sudo update-alternatives --install /usr/bin/cpp cpp /usr/bin/cpp-4.8 20
+sudo update-alternatives --set gcc /usr/bin/gcc-6
+sudo update-alternatives --set cpp /usr/bin/cpp-6
+gcc --version
+g++ --version
+cpp --version
+
 # Remove MPI as this causes problems on other platforms without it
 sudo apt-get -y --purge autoremove libboost-mpi-dev
 sudo apt-get -y --purge autoremove libboost-mpi-python-dev
