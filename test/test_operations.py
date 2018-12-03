@@ -8,6 +8,7 @@ import sys
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument('--replicated', action='store_true')
 parser.add_argument('--long_test', action='store_true')
+parser.add_argument('--max_diff_count', type=int, default=25)
 FLAGS, leftovers = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + leftovers
 # Setup import folders.
@@ -19,16 +20,23 @@ sys.path.insert(0, _XLA_FOLDER)
 import collections
 from common_utils import TestCase, run_tests, iter_indices
 import itertools
+import numpy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch_xla
+import torch_xla_py.utils as xu
 import torch_xla_py.xla_model as xm
+import torchvision
 import unittest
 
 
 DeviceSupport = collections.namedtuple('DeviceSupport', ['num_devices'])
+
+
+def _gen_tensor(*args, dtype=torch.float32, requires_grad=False):
+    return torch.randn(*args, dtype=dtype, requires_grad=requires_grad)
 
 
 class Holder(object):
@@ -55,7 +63,7 @@ class FnDataGenerator(object):
     def next(self):
         if self._emitted >= self._count:
             raise StopIteration
-        data = torch.randn(self._batch_size, self._dim)
+        data = _gen_tensor(self._batch_size, self._dim)
         target = self._func(data)
         self._emitted += 1
         return data, target
@@ -102,7 +110,7 @@ def _random_inputs(shapes, num_replicas=1):
     for _ in range(0, num_replicas):
         replica_inputs = []
         for shape in shapes:
-            replica_inputs.append(torch.randn(*shape))
+            replica_inputs.append(_gen_tensor(*shape))
         random_tensors.append(tuple(replica_inputs))
     return tuple(random_tensors)
 
@@ -111,7 +119,7 @@ def _random_like(tensor_list):
     random_tensors = []
     for o in tensor_list:
         if o.dtype == torch.float32 or o.dtype == torch.float64:
-            random_tensors += [torch.randn(*o.shape, dtype=o.dtype)]
+            random_tensors += [_gen_tensor(*o.shape, dtype=o.dtype)]
         elif o.dtype == torch.int64:
             # TODO remove this, we shouldn't be needing to pass random_tensor for long types
             random_tensors += [torch.empty_like(o)]
@@ -133,17 +141,19 @@ def _zeros_like(tensor_list):
     return zeros_tensors
 
 
-def _dump_differences(target, result, rtol=1e-5, atol=1e-3):
+def _dump_differences(target, result, rtol=1e-5, atol=1e-3, max_diff_count=0):
     env = Holder()
     env.max_diff = 0.0
     env.max_rel = None
     env.max_index = None
+    env.diff_count = 0
 
     def check_values(a, b, index):
         r = max(abs(a), abs(b)) * rtol
         diff = abs(a - b)
-        if diff > min(r, atol):
+        if diff > max(r, atol):
             print('a={}\tb={}\tdiff={}\tindex={}'.format(a, b, diff, index))
+            env.diff_count += 1
             if diff > env.max_diff:
                 env.max_diff = diff
                 env.max_rel = diff / max(abs(a), abs(b))
@@ -155,6 +165,8 @@ def _dump_differences(target, result, rtol=1e-5, atol=1e-3):
         if target.dim() > 0:
             for i in iter_indices(target):
                 check_values(target[i], result[i], i)
+                if max_diff_count > 0 and env.diff_count >= max_diff_count:
+                    break
         else:
             check_values(target.item(), result.item(), 0)
     elif isinstance(target, (list, tuple)):
@@ -162,6 +174,8 @@ def _dump_differences(target, result, rtol=1e-5, atol=1e-3):
         assert len(target) == len(result)
         for i, v in enumerate(target):
             check_values(v, result[i], [i])
+            if max_diff_count > 0 and env.diff_count >= max_diff_count:
+                break
     elif isinstance(target, float):
         assert isinstance(result, float)
         check_values(target, result, [])
@@ -176,13 +190,7 @@ def _xla_run(model, input, device='TPU'):
         xla_model = xm.XlaModel(model, input[0], num_cores=len(input),
                                 devices=devices, full_conv_precision=True)
         output_xla = xla_model(*input)
-        output = []
-        for xla_replica_outputs in output_xla:
-            replica_outputs = []
-            for o in xm.as_list(xla_replica_outputs):
-                replica_outputs.append(o.to_tensor())
-            output.append(tuple(replica_outputs))
-        return tuple(output)
+        return xm.convert_to_tensors(output_xla)
     else:
         xla_model = xm.XlaModel(model, [input], full_conv_precision=True)
         output_xla = xla_model(input)
@@ -203,24 +211,42 @@ class XlaTestCase(TestCase):
             if torch.le(diff_tensor, max_abs_err).min().item() == 0:
                 self.fail('Relative error higher than the maximum tolerance')
         except:
-            _dump_differences(out, expected, rtol=rel_err, atol=abs_err)
+            _dump_differences(out, expected, rtol=rel_err, atol=abs_err,
+                              max_diff_count=FLAGS.max_diff_count)
             raise
 
     def assertEqualDbg(self, out, expected):
         try:
             super(XlaTestCase, self).assertEqual(out, expected)
         except:
-            _dump_differences(out, expected, rtol=1e-8, atol=1e-8)
+            _dump_differences(out, expected, rtol=1e-8, atol=1e-8,
+                              max_diff_count=FLAGS.max_diff_count)
             raise
 
     def compareReplicated(self, model, inputs, xla_outputs):
         self.assertEqual(len(inputs), len(xla_outputs))
         for i, input in enumerate(inputs):
-            expected = xm.as_list(model(*input))
-            xla_output = xm.as_list(xla_outputs[i])
+            expected = xu.as_list(model(*input))
+            xla_output = xu.as_list(xla_outputs[i])
             self.assertEqual(len(expected), len(xla_output))
             for j, expected_tensor in enumerate(expected):
                 self.assertEqualDbg(xla_output[j], expected_tensor)
+
+    def compareModel(self, model, input, rel_err=1e-2, abs_err=1e-5):
+        xla_model = xm.XlaModel(model, [input], full_conv_precision=True)
+        output_xla = xla_model(input)
+        output = model(input)
+        self.assertEqualRel(output, xm.convert_to_tensors(output_xla)[0],
+                            rel_err=rel_err, abs_err=abs_err)
+        grad_output = _gen_tensor(*output.shape)  # random gradients
+        output.backward(grad_output)
+        xla_model.backward([grad_output])
+        xla_updated_params = [
+            p.to_tensor().data for p in xla_model.parameters()[0]]
+        updated_params = [p.data for p in model.parameters()]
+        for i in range(0, len(updated_params)):
+            self.assertEqualRel(xla_updated_params[i], updated_params[i],
+                                rel_err=rel_err, abs_err=abs_err)
 
 
 class TestMulAdd(XlaTestCase):
@@ -248,7 +274,7 @@ class TestRelu(XlaTestCase):
             def forward(self, x):
                 return F.relu(x)
 
-        x = torch.randn(2, 1, 4, 6)
+        x = _gen_tensor(2, 1, 4, 6)
         model = XlaRelu()
         out = _xla_run(model, x)
         expected = model(x)
@@ -415,7 +441,7 @@ class TestConv(XlaTestCase):
         for stride in range(1, 4):
             for padding in range(0, 3):
                 for bias in [True, False]:
-                    x = torch.randn(32, 10, 28, 28)
+                    x = _gen_tensor(32, 10, 28, 28)
                     model = XlaConv(stride, padding, bias)
                     out = _xla_run(model, x)
                     expected = model(x)
@@ -528,19 +554,25 @@ class XlaMNIST(nn.Module):
 class TestMNIST(XlaTestCase):
     def test(self):
         batch_size = 32
-        x = torch.randn(batch_size, 1, 28, 28)
+        x = _gen_tensor(batch_size, 1, 28, 28)
         model = XlaMNIST()
-        out = _xla_run(model, x)
-        expected = model(x)
-        self.assertEqualDbg(out.data, expected.data)
+        self.compareModel(model, x)
+
+
+class TestResnet18(XlaTestCase):
+    def test(self):
+        batch_size = 4
+        x = _gen_tensor(batch_size, 3, 224, 224)
+        model = torchvision.models.resnet18()
+        self.compareModel(model, x)
 
 
 class AxPlusB(nn.Module):
     def __init__(self, dims=None):
         super(AxPlusB, self).__init__()
         self.ones = torch.ones(*dims)
-        self.a = nn.Parameter(torch.randn(1, 1))
-        self.b = nn.Parameter(torch.randn(1, 1))
+        self.a = nn.Parameter(_gen_tensor(1, 1))
+        self.b = nn.Parameter(_gen_tensor(1, 1))
 
     def forward(self, x):
         return x.mm(self.a) + self.ones.mm(self.b)
@@ -563,14 +595,14 @@ class TestAxPlusB(XlaTestCase):
         A = 3.11
         B = 4.09
         model = AxPlusB(dims=(1, 1))
-        xla_model = xm.XlaModel(model, [torch.randn(1, 1)])
+        xla_model = xm.XlaModel(model, [_gen_tensor(1, 1)])
         optimizer = optim.SGD(xla_model.parameters_list(),
                               lr=0.1, momentum=0.5)
         square_loss = SquareLoss()
         loss = None
         for _ in range(0, 100):
             optimizer.zero_grad()
-            x = torch.randn(1, 1)
+            x = _gen_tensor(1, 1)
             target = x * A + B
             y = xla_model(x)
             loss = square_loss(y[0], target)
@@ -587,7 +619,7 @@ class TestAxPlusBGen(XlaTestCase):
         batch_size = 128
         gen = FnDataGenerator(lambda x: x * A + B, batch_size, count=100)
         model = AxPlusB(dims=(batch_size, 1))
-        xla_model = xm.XlaModel(model, [torch.randn(batch_size, 1)])
+        xla_model = xm.XlaModel(model, [_gen_tensor(batch_size, 1)])
         optimizer = optim.SGD(xla_model.parameters_list(),
                               lr=0.1, momentum=0.5)
         square_loss = SquareLoss()
@@ -616,8 +648,8 @@ class TestAxPlusBGenXla(XlaTestCase):
         B = 4.09
         gen = FnDataGenerator(lambda x: x * A + B, batch_size, count=100)
         model = AxPlusB(dims=(batch_size, 1))
-        xla_model = xm.XlaModel(model, [torch.randn(batch_size, 1)],
-                                target=torch.randn(batch_size, 1),
+        xla_model = xm.XlaModel(model, [_gen_tensor(batch_size, 1)],
+                                target=_gen_tensor(batch_size, 1),
                                 loss_fn=loss_fn, num_cores=1, devices=[':0'])
         optimizer = optim.SGD(xla_model.parameters_list(),
                               lr=0.1, momentum=0.5)
@@ -645,7 +677,7 @@ class TestSum(XlaTestCase):
             def forward(self, x):
                 return x.sum(dim=self.dim)
 
-        x = torch.randn(2, 3, 4, 6)
+        x = _gen_tensor(2, 3, 4, 6)
         for dim in range(0, x.dim()):
             model = XlaSum(dim)
             out = _xla_run(model, x)
@@ -664,7 +696,7 @@ class XlaNllLoss(nn.Module):
 
 class TestNllLoss(TestCase):
     def test(self):
-        input = torch.randn(3, 5, requires_grad=True)
+        input = _gen_tensor(3, 5, requires_grad=True)
         target = torch.empty(3, dtype=torch.long).random_(5)
         model = XlaNllLoss()
         traced_model = torch.jit.trace(model, (input, target))
@@ -712,7 +744,7 @@ class TestGradients(XlaTestCase):
 
         # forward function
         raw_outputs = exec_f(*inputs_params_buffers)
-        raw_outputs = xm.as_list(raw_outputs)
+        raw_outputs = xu.as_list(raw_outputs)
         intermediate_outputs = [raw_output for raw_output in raw_outputs[gradient.f_real_outputs:]
                                 if raw_output.dtype == torch.float32]
         outputs = raw_outputs[:gradient.f_real_outputs]
@@ -729,7 +761,7 @@ class TestGradients(XlaTestCase):
                              for i in gradient.df_input_captured_outputs]
 
         grad_inputs = exec_df(*raw_grad_outputs)
-        grad_inputs = xm.as_list(grad_inputs)
+        grad_inputs = xu.as_list(grad_inputs)
 
         ##############################################################
         # backward with XLA
@@ -748,7 +780,7 @@ class TestGradients(XlaTestCase):
         ##############################################################
         # forward + backward with regular autograd / torch
         outputs_gt = model(*inputs)
-        outputs_gt = xm.as_list(outputs_gt)
+        outputs_gt = xu.as_list(outputs_gt)
         grad_inputs_gt = torch.autograd.grad(outputs_gt,
                                              inputs_params,
                                              grad_outputs,
@@ -784,7 +816,7 @@ class TestGradients(XlaTestCase):
             for padding in [0, 1]:
                 for count_include_pad in [False, True]:
                     model = AvgPoolGrad(stride, padding, count_include_pad)
-                    inputs = [torch.randn(4, 1, 28, 28, requires_grad=True)]
+                    inputs = [_gen_tensor(4, 1, 28, 28, requires_grad=True)]
                     self.checkGrad(model, inputs, xla=True)
 
     def test_threshold(self):
@@ -797,7 +829,7 @@ class TestGradients(XlaTestCase):
                 return self.threshold(x)
 
         model = ThresholdPoolGrad()
-        inputs = [torch.randn(4, 2, requires_grad=True)]
+        inputs = [_gen_tensor(4, 2, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True)
 
     def test_maxpool(self):
@@ -806,7 +838,7 @@ class TestGradients(XlaTestCase):
                 return F.max_pool2d(x, 2)
 
         model = MaxPoolGrad()
-        inputs = [torch.randn(4, 1, 28, 28, requires_grad=True)]
+        inputs = [_gen_tensor(4, 1, 28, 28, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True)
 
     def test_tanh(self):
@@ -815,7 +847,7 @@ class TestGradients(XlaTestCase):
                 return torch.tanh(x)
 
         model = TanhGrad()
-        inputs = [torch.randn(4, 2, requires_grad=True)]
+        inputs = [_gen_tensor(4, 2, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True)
 
     def test_sigmoid(self):
@@ -824,7 +856,7 @@ class TestGradients(XlaTestCase):
                 return torch.sigmoid(x)
 
         model = SigmoidGrad()
-        inputs = [torch.randn(4, 2, requires_grad=True)]
+        inputs = [_gen_tensor(4, 2, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True, rel_err=1e-2, abs_err=1e-2)
 
     @unittest.skip('differentiation of prim::ListUnpack is not supported, or it is missing necessary type information')
@@ -834,7 +866,7 @@ class TestGradients(XlaTestCase):
                 return x.chunk(2, 1)
 
         model = ChunkGrad()
-        inputs = [torch.randn(4, 4, requires_grad=True)]
+        inputs = [_gen_tensor(4, 4, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True)
 
     @unittest.skip('bool value of Tensor with more than one value is ambiguous')
@@ -859,9 +891,9 @@ class TestGradients(XlaTestCase):
                 return hy, cy
 
         model = LSTMCellGrad()
-        inputs = [torch.randn(4, 3, requires_grad=True),
-                  torch.randn(4, 2, requires_grad=True),
-                  torch.randn(4, 2, requires_grad=True)]
+        inputs = [_gen_tensor(4, 3, requires_grad=True),
+                  _gen_tensor(4, 2, requires_grad=True),
+                  _gen_tensor(4, 2, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True)
 
     def test_conv2d(self):
@@ -887,7 +919,7 @@ class TestGradients(XlaTestCase):
                 itertools.product(*config)):
             # TODO: dilation, groups, transpose
             model = nn.Conv2d(ichans, ochans, size, stride, padding, bias=bias)
-            inputs = [torch.randn(4, ichans, 28, 28, requires_grad=True)]
+            inputs = [_gen_tensor(4, ichans, 28, 28, requires_grad=True)]
             self.checkGrad(model, inputs, xla=True, abs_err=1e-3)
 
     def test_batchnorm2d(self):
@@ -895,7 +927,7 @@ class TestGradients(XlaTestCase):
             for eps in [1e-5, 1e-3, 1e-2]:
                 # TODO: momentum, training, affine
                 model = nn.BatchNorm2d(chans, eps=eps)
-                inputs = [torch.randn(4, chans, 28, 28, requires_grad=True)]
+                inputs = [_gen_tensor(4, chans, 28, 28, requires_grad=True)]
                 self.checkGrad(model, inputs, xla=True)
 
     def test_logsoftmax(self):
@@ -906,11 +938,11 @@ class TestGradients(XlaTestCase):
                         return F.log_softmax(x, dim)
 
                 model = LSMGrad()
-                inputs = [torch.randn(batch, 9, requires_grad=True)]
+                inputs = [_gen_tensor(batch, 9, requires_grad=True)]
                 self.checkGrad(model, inputs, xla=True)
 
     def test_nll_loss(self):
-        input = torch.randn(3, 5, requires_grad=True)
+        input = _gen_tensor(3, 5, requires_grad=True)
         target = torch.empty(3, dtype=torch.long).random_(5)
         model = XlaNllLoss()
         traced_model = torch.jit.trace(model, (input, target))
@@ -925,14 +957,13 @@ class TestGradients(XlaTestCase):
 
     def test_mnist(self):
         model = XlaMNIST()
-        inputs = [torch.randn(4, 1, 28, 28, requires_grad=True)]
+        inputs = [_gen_tensor(4, 1, 28, 28, requires_grad=True)]
         self.checkGrad(model, inputs, xla=True)
 
     @unittest.skip('Disable until we figure out the precision issue')
     def test_resnet(self):
-        import torchvision
-        model = torchvision.models.resnet50()
-        inputs = [torch.randn(4, 3, 224, 224, requires_grad=True)]
+        model = torchvision.models.resnet18()
+        inputs = [_gen_tensor(4, 3, 224, 224, requires_grad=True)]
         self.checkGrad(model, inputs, xla=False)
 
 
@@ -969,7 +1000,7 @@ class TestOptimizer(XlaTestCase):
         self.assertEqualDbg(y / x, (xla_y / xla_x).to_tensor())
 
     def checkSgd(self, lr, momentum, weight_decay, nsteps, do_zero_grad):
-        input = torch.randn(4, 4, requires_grad=True)
+        input = _gen_tensor(4, 4, requires_grad=True)
         model = nn.Linear(4, 20)
         traced_model = torch.jit.trace(model, input)
         xla_model = torch_xla._XLAC.XlaModule(
@@ -981,7 +1012,7 @@ class TestOptimizer(XlaTestCase):
         optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum,
                               weight_decay=weight_decay)
         output = model(input)
-        grad_output = torch.randn(*output.shape)  # random gradients
+        grad_output = _gen_tensor(*output.shape)  # random gradients
         grad_output_xla = [torch_xla._XLAC.XLATensor(grad_output)]
         output.backward(grad_output)
         xla_model.backward((tuple(grad_output_xla)))

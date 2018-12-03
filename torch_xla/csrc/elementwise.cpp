@@ -1,5 +1,7 @@
 #include "elementwise.h"
+
 #include "helpers.h"
+#include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 
 namespace torch {
 namespace jit {
@@ -17,14 +19,16 @@ xla::XlaOp BuildArithmeticOp(const Node* node, const xla::XlaOp& lhs,
       return lhs - rhs;
     }
     default:
-      LOG(FATAL) << "Invalid binary operator kind: " << node->kind();
+      TF_LOG(FATAL) << "Invalid binary operator kind: " << node->kind();
   }
 }
 
 xla::XlaOp BuildComparisonOp(const Node* node, const xla::XlaOp& operand) {
   auto builder = operand.builder();
+  xla::Shape operand_shape = XlaHelpers::ShapeOfXlaOp(operand);
   const auto xla_other = XlaHelpers::ScalarValue(
-      node->get<at::Scalar>(attr::other).value().to<float>(), builder);
+      node->get<at::Scalar>(attr::other).value().to<float>(),
+      operand_shape.element_type(), builder);
   xla::XlaOp pred;
   switch (node->kind()) {
     case aten::gt: {
@@ -32,7 +36,7 @@ xla::XlaOp BuildComparisonOp(const Node* node, const xla::XlaOp& operand) {
       break;
     }
     default:
-      LOG(FATAL) << "Invalid binary operator kind: " << node->kind();
+      TF_LOG(FATAL) << "Invalid binary operator kind: " << node->kind();
   }
   return xla::ConvertElementType(pred, xla::PrimitiveType::S8);
 }
@@ -44,8 +48,12 @@ xla::XlaOp BuildThreshold(const Node* node, const xla::XlaOp& input,
   const auto input_sizes = XlaHelpers::TensorDimensionSizes(node_inputs[0]);
   std::vector<xla::int64> broadcast_sizes(input_sizes.begin(),
                                           input_sizes.end());
-  const auto xla_threshold = XlaHelpers::ScalarValue<float>(threshold, b);
-  const auto xla_value = XlaHelpers::ScalarValue<float>(value, b);
+  xla::Shape input_shape = XlaHelpers::ShapeOfXlaOp(input);
+  xla::Shape output_shape = XlaHelpers::ShapeOfXlaOp(output);
+  const auto xla_threshold =
+      XlaHelpers::ScalarValue<float>(threshold, input_shape.element_type(), b);
+  const auto xla_value =
+      XlaHelpers::ScalarValue<float>(value, output_shape.element_type(), b);
   return xla::Select(xla::Gt(input, xla_threshold), output,
                      xla::Broadcast(xla_value, broadcast_sizes));
 }
