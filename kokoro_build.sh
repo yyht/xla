@@ -47,7 +47,7 @@ sh Anaconda3-5.2.0-Linux-x86_64.sh -b
 export PATH="$HOME/anaconda3/bin:$PATH"
 
 # Setup conda env
-conda create --name pytorch python=3.5 anaconda
+conda create --name pytorch python=3.5.6 anaconda
 source activate pytorch
 export CMAKE_PREFIX_PATH="$(dirname $(which conda))/../"
 conda install -y numpy pyyaml mkl mkl-include setuptools cmake cffi typing bazel
