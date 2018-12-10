@@ -6,9 +6,9 @@ set -e
 set -x
 
 # Test to check we can pull clang from Kokoro
-sudo bash -c 'echo "deb http://deb.debian.org/debian/ testing main" >> /etc/apt/sources.list'
-sudo apt-get update
-sudo apt-get install -y --force-yes clang-7 clang++-7
+#sudo bash -c 'echo "deb http://deb.debian.org/debian/ testing main" >> /etc/apt/sources.list'
+#sudo apt-get update
+#sudo apt-get install -y --force-yes clang-7 clang++-7
 
 # Update compilers to use gcc/g++/cpp-6 as default
 sudo apt-get update
