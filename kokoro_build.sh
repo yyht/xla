@@ -6,7 +6,7 @@ set -e
 set -x
 
 # Test to check we can pull clang from Kokoro
-sudo apt-get install clang-7 clang++-7
+sudo apt-get install -y clang-7 clang++-7
 
 # Update compilers to use gcc/g++/cpp-6 as default
 sudo apt-get update
