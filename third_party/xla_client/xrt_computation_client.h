@@ -15,6 +15,7 @@
 #include "tensorflow/cc/framework/scope.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/compiler/xla/xla_client/computation_client.h"
+#include "tensorflow/compiler/xla/xla_client/triggered_task.h"
 #include "tensorflow/compiler/xla/xla_client/xrt_session.h"
 #include "tensorflow/compiler/xla/xla_client/xrt_session_cache.h"
 #include "tensorflow/compiler/xla/xla_data.pb.h"
@@ -49,7 +50,13 @@ class XrtComputationClient : public ComputationClient {
       }
     }
 
-    void Release() { releaser = nullptr; }
+    absl::optional<int64> Release() {
+      if (releaser == nullptr) {
+        return absl::nullopt;
+      }
+      releaser = nullptr;
+      return handle;
+    }
 
     int64 handle;
     Releaser releaser;
@@ -84,6 +91,12 @@ class XrtComputationClient : public ComputationClient {
 
   XrtComputationClient(Options options);
 
+  void FlushLazyReleases() override;
+
+  size_t ForceReleaseHandles(
+      tensorflow::gtl::ArraySlice<const std::shared_ptr<Data>> handles)
+      override;
+
   std::vector<std::shared_ptr<Data>> TransferToServer(
       tensorflow::gtl::ArraySlice<const LiteralDevice> literals) override;
 
@@ -91,22 +104,22 @@ class XrtComputationClient : public ComputationClient {
       tensorflow::gtl::ArraySlice<const std::shared_ptr<Data>> handles)
       override;
 
-  std::shared_ptr<Data> ExecuteComputation(
+  std::vector<std::shared_ptr<Data>> ExecuteComputation(
       const XlaComputation& computation,
       tensorflow::gtl::ArraySlice<Data*> arguments, const string& device,
-      const Shape* output_shape) override;
+      const ExecuteComputationOptions& options) override;
 
-  std::vector<std::shared_ptr<Data>> ExecuteReplicated(
+  std::vector<std::vector<std::shared_ptr<Data>>> ExecuteReplicated(
       const XlaComputation& computation,
       const std::vector<std::vector<Data*>>& arguments,
       tensorflow::gtl::ArraySlice<const string> devices,
-      const Shape* output_shape) override;
+      const ExecuteReplicatedOptions& options) override;
 
-  std::vector<std::shared_ptr<Data>> ExecuteParallel(
+  std::vector<std::vector<std::shared_ptr<Data>>> ExecuteParallel(
       tensorflow::gtl::ArraySlice<const XlaComputation> computations,
       const std::vector<std::vector<Data*>>& arguments,
       tensorflow::gtl::ArraySlice<const string> devices,
-      tensorflow::gtl::ArraySlice<const Shape* const> output_shapes) override;
+      const ExecuteParallelOptions& options) override;
 
   std::vector<std::vector<std::shared_ptr<Data>>> DeconstructTuple(
       tensorflow::gtl::ArraySlice<const std::shared_ptr<Data>> tuples) override;
@@ -168,18 +181,18 @@ class XrtComputationClient : public ComputationClient {
       tensorflow::gtl::ArraySlice<const XlaComputation> computations,
       const std::vector<std::vector<Data*>>& arguments,
       tensorflow::gtl::ArraySlice<const Shape* const> output_shapes,
-      tensorflow::gtl::ArraySlice<const string> devices,
+      bool explode_tuple, tensorflow::gtl::ArraySlice<const string> devices,
       tensorflow::ClientSession::FeedType* feed_inputs);
 
   std::vector<ExecuteContext> CreateExecuteOps(
       XrtSessionCache::SessionMap* session_map,
       const XlaComputation& computation,
       const std::vector<std::vector<Data*>>& arguments,
-      const Shape* output_shape,
+      const Shape* output_shape, bool explode_tuple,
       tensorflow::gtl::ArraySlice<const string> devices,
       tensorflow::ClientSession::FeedType* feed_inputs);
 
-  std::vector<std::shared_ptr<Data>> RunComputations(
+  std::vector<std::vector<std::shared_ptr<Data>>> RunComputations(
       const XrtSessionCache::SessionMap& session_map,
       const std::vector<ExecuteContext>& exec_ops,
       tensorflow::gtl::ArraySlice<const XlaComputation* const> computations,
@@ -197,15 +210,14 @@ class XrtComputationClient : public ComputationClient {
 
   void ReleaseHandles(tensorflow::gtl::ArraySlice<const DeviceHandle> handles);
 
-  // Flushes all the outstanding released handles in one RPC swipe.
-  void FlushReleasedHandles();
+  bool ReleaseXrtData(XrtData* xrt_data);
 
-  // Function which is called at every entry into the XRT computation client
-  // APIs. Performs tasks to intialize the per-call context, like flushing all
-  // the accumulated handle releases, and rewinding the XRT node caches.
-  void ApiCallInitialize();
+  // Starts the handle releaser thread (which runs the HandleReleaser() API).
+  void StartHandleReleaser();
 
-  void ReleaseXrtData(XrtData* xrt_data);
+  // The handler releaser function. Runs in the releaser thread and never
+  // returns.
+  void HandleReleaser();
 
   // Retrieves the mesh coordinates of a given XRT device.
   const std::vector<int>& GetDeviceMeshCoords(const string& xrt_device) const;
@@ -214,6 +226,10 @@ class XrtComputationClient : public ComputationClient {
       const string& xrt_device);
 
   void InitializeDevices();
+
+  std::vector<std::shared_ptr<Data>> GetComputationResults(
+      const tensorflow::Tensor& xrt_result, const Shape& result_shape,
+      const string& device);
 
   // Creates an XRT graph with an XRTCompile, feeding into an XRTExecute
   // operation:
@@ -295,6 +311,7 @@ class XrtComputationClient : public ComputationClient {
   std::mutex lock_;
   std::map<string, std::vector<int>> device_mesh_coords_;
   XrtSessionCache session_cache_;
+  std::unique_ptr<xla_util::TriggeredTask> triggered_task_;
   // Access to the following members must be done while holding lock_.
   // XRT thread safety semantics.
   std::vector<DeviceHandle> released_handles_;

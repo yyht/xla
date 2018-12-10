@@ -10,6 +10,7 @@
 #include "tensorflow/compiler/xla/client/global_data.h"
 #include "tensorflow/compiler/xla/rpc/grpc_stub.h"
 #include "tensorflow/compiler/xla/xla_client/computation_client.h"
+#include "tensorflow/compiler/xla/xla_client/triggered_task.h"
 
 namespace xla {
 
@@ -30,7 +31,6 @@ class XlaComputationClient : public ComputationClient {
     }
 
     std::unique_ptr<GlobalData> Release() {
-      CHECK(releaser != nullptr);
       releaser = nullptr;
       return std::move(handle);
     }
@@ -50,6 +50,12 @@ class XlaComputationClient : public ComputationClient {
 
   XlaComputationClient(Options options);
 
+  void FlushLazyReleases() override;
+
+  size_t ForceReleaseHandles(
+      tensorflow::gtl::ArraySlice<const std::shared_ptr<Data>> handles)
+      override;
+
   std::vector<std::shared_ptr<Data>> TransferToServer(
       tensorflow::gtl::ArraySlice<const LiteralDevice> literals) override;
 
@@ -57,22 +63,22 @@ class XlaComputationClient : public ComputationClient {
       tensorflow::gtl::ArraySlice<const std::shared_ptr<Data>> handles)
       override;
 
-  std::shared_ptr<Data> ExecuteComputation(
+  std::vector<std::shared_ptr<Data>> ExecuteComputation(
       const XlaComputation& computation,
       tensorflow::gtl::ArraySlice<Data*> arguments, const string& device,
-      const Shape* output_shape) override;
+      const ExecuteComputationOptions& options) override;
 
-  std::vector<std::shared_ptr<Data>> ExecuteReplicated(
+  std::vector<std::vector<std::shared_ptr<Data>>> ExecuteReplicated(
       const XlaComputation& computation,
       const std::vector<std::vector<Data*>>& arguments,
       tensorflow::gtl::ArraySlice<const string> devices,
-      const Shape* output_shape) override;
+      const ExecuteReplicatedOptions& options) override;
 
-  std::vector<std::shared_ptr<Data>> ExecuteParallel(
+  std::vector<std::vector<std::shared_ptr<Data>>> ExecuteParallel(
       tensorflow::gtl::ArraySlice<const XlaComputation> computations,
       const std::vector<std::vector<Data*>>& arguments,
       tensorflow::gtl::ArraySlice<const string> devices,
-      tensorflow::gtl::ArraySlice<const Shape* const> output_shapes) override;
+      const ExecuteParallelOptions& options) override;
 
   std::vector<std::vector<std::shared_ptr<Data>>> DeconstructTuple(
       tensorflow::gtl::ArraySlice<const std::shared_ptr<Data>> tuples) override;
@@ -90,11 +96,15 @@ class XlaComputationClient : public ComputationClient {
   // GetDefaultDevice() API.
   string GetEffectiveDevice(const string& device) const;
 
-  // Flushes all the outstanding released handles in one RPC swipe.
-  void FlushReleasedHandles();
-
   // Batches an XLA handle for release.
-  void ReleaseXlaData(XlaData* xla_data);
+  bool ReleaseXlaData(XlaData* xla_data);
+
+  // Starts the handle releaser thread (which runs the HandleReleaser() API).
+  void StartHandleReleaser();
+
+  // The handler releaser function. Runs in the releaser thread and never
+  // returns.
+  void HandleReleaser();
 
   Options options_;
   std::mutex lock_;
@@ -104,6 +114,7 @@ class XlaComputationClient : public ComputationClient {
   std::unique_ptr<GRPCStub> stub_;
   std::vector<DeviceHandle> device_handles_;
   std::vector<std::unique_ptr<GlobalData>> released_handles_;
+  std::unique_ptr<xla_util::TriggeredTask> triggered_task_;
 };
 
 }  // namespace xla

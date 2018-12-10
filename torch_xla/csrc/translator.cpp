@@ -1,6 +1,5 @@
 #include "translator.h"
 #include <memory>
-#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -24,11 +23,8 @@ namespace jit {
 
 namespace {
 
-std::once_flag create_client_flag;
-std::unique_ptr<xla::ComputationClient> computation_client;
-
-void CreateClient(std::unique_ptr<xla::ComputationClient>* client) {
-  *client = std::move(xla::ComputationClient::Create().ValueOrDie());
+xla::ComputationClient* CreateClient() {
+  return xla::ComputationClient::Create().ConsumeValueOrDie().release();
 }
 
 xla::XlaOp GetConstantOp(xla::XlaBuilder* builder, Node* node) {
@@ -147,8 +143,8 @@ class ComputationContext {
 }  // namespace
 
 xla::ComputationClient* XlaGetClient() {
-  std::call_once(create_client_flag, CreateClient, &computation_client);
-  return computation_client.get();
+  static xla::ComputationClient* computation_client = CreateClient();
+  return computation_client;
 }
 
 XlaTranslator::XlaTranslator(
@@ -411,23 +407,23 @@ XlaComputationInOut XlaTranslator::BuildComputationProgram(
       }
       case aten::stack: {
         CHECK_EQ(node->inputs().size(), 2);
-        xla::XlaOp xla_output = BuildStack(
-            node,
-            [&cctx](const Value* node) -> xla::XlaOp {
-              return cctx.GetOpForValue(node);
-            },
-            b);
+        xla::XlaOp xla_output =
+            BuildStack(node,
+                       [&cctx](const Value* node) -> xla::XlaOp {
+                         return cctx.GetOpForValue(node);
+                       },
+                       b);
         cctx.AddNodeOp(node, xla_output);
         break;
       }
       case aten::cat: {
         CHECK_EQ(node->inputs().size(), 2);
-        xla::XlaOp xla_output = BuildCat(
-            node,
-            [&cctx](const Value* node) -> xla::XlaOp {
-              return cctx.GetOpForValue(node);
-            },
-            b);
+        xla::XlaOp xla_output =
+            BuildCat(node,
+                     [&cctx](const Value* node) -> xla::XlaOp {
+                       return cctx.GetOpForValue(node);
+                     },
+                     b);
         cctx.AddNodeOp(node, xla_output);
         break;
       }
