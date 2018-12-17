@@ -12,6 +12,7 @@
 #include "nll_loss.h"
 #include "pooling.h"
 #include "reduction.h"
+#include "size_ops.h"
 #include "tensor.h"
 #include "tensorflow/compiler/xla/types.h"
 #include "tensorflow/compiler/xla/xla_client/computation_client.h"
@@ -84,6 +85,13 @@ class ComputationContext {
 
   void AddUndefinedInput(size_t index) { undefined_inputs_.insert(index); }
 
+  void AddSizeOpResult(const Value* value,
+                       const std::vector<xla::int64>& size_op_result) {
+    const auto it_ok = size_op_values_.emplace(value->unique(), size_op_result);
+    XLA_CHECK(it_ok.second)
+        << "Duplicated aten::size id: " << value->uniqueName();
+  }
+
   const xla::XlaOp& GetOpForValue(const Value* value) const {
     auto it = node_xla_ops_.find(value->unique());
     XLA_CHECK(it != node_xla_ops_.end()) << value->uniqueName() << "\nGraph:\n"
@@ -126,6 +134,19 @@ class ComputationContext {
 
   size_t GetInputsSize() const { return input_ops_.size(); }
 
+  const XlaComputationInOut::SizeOpValues& GetSizeOpValues() const {
+    return size_op_values_;
+  }
+
+  c10::optional<std::vector<xla::int64>> GetSizeOpValueForId(
+      const size_t id) const {
+    const auto it = size_op_values_.find(id);
+    if (it != size_op_values_.end()) {
+      return it->second;
+    }
+    return c10::nullopt;
+  }
+
   const std::unordered_map<size_t, xla::XlaOp>& GetNodeOps() const {
     return node_xla_ops_;
   }
@@ -138,6 +159,7 @@ class ComputationContext {
   std::vector<xla::XlaOp> input_ops_;
   std::unordered_map<size_t, xla::XlaOp> node_xla_ops_;
   std::unordered_set<size_t> undefined_inputs_;
+  XlaComputationInOut::SizeOpValues size_op_values_;
 };
 
 }  // namespace
@@ -152,24 +174,27 @@ XlaTranslator::XlaTranslator(
     const xla::PrecisionConfig::Precision conv_precision)
     : graph_(graph), conv_precision_(conv_precision) {}
 
-xla::XlaComputation XlaTranslator::BuildComputation(
+XlaTranslationResult XlaTranslator::BuildComputation(
     const std::string& name,
     const std::vector<ParameterShape>& parameter_shapes,
+    const XlaComputationInOut::SizeOpValues& param_size_op_values,
     const BuildOptions& options) const {
   xla::XlaBuilder b(name);
-  auto returned_tuple = BuildComputationProgram(parameter_shapes, &b);
+  auto computation_program =
+      BuildComputationProgram(parameter_shapes, param_size_op_values, &b);
   if (options.output_transform) {
-    for (size_t i = 0; i < returned_tuple.outputs.size(); ++i) {
-      returned_tuple.outputs[i] =
-          options.output_transform(returned_tuple.outputs[i], i);
+    for (size_t i = 0; i < computation_program.outputs.size(); ++i) {
+      computation_program.outputs[i] =
+          options.output_transform(computation_program.outputs[i], i);
     }
   }
-  XlaHelpers::CreateReturnValue(&b, returned_tuple.outputs);
-  return b.Build().ValueOrDie();
+  XlaHelpers::CreateReturnValue(&b, computation_program.outputs);
+  return {b.Build().ValueOrDie(), computation_program.ret_size_op_values};
 }
 
 XlaComputationInOut XlaTranslator::BuildComputationProgram(
     const std::vector<ParameterShape>& parameter_shapes,
+    const XlaComputationInOut::SizeOpValues& param_size_op_values,
     xla::XlaBuilder* b) const {
   ComputationContext cctx;
   const auto graph_inputs = graph_->inputs();
@@ -193,6 +218,11 @@ XlaComputationInOut XlaTranslator::BuildComputationProgram(
       cctx.AddValueOp(graph_input,
                       XlaHelpers::ScalarBroadcast<float>(
                           0, parameter_shapes[parameter_number].shape, b));
+    }
+    // Seed aten::size tracking info with the values in param_size_op_values.
+    const auto size_op_value_it = param_size_op_values.find(parameter_number);
+    if (size_op_value_it != param_size_op_values.end()) {
+      cctx.AddSizeOpResult(graph_input, size_op_value_it->second);
     }
   }
   auto nodes = graph_->block()->nodes();
@@ -489,6 +519,15 @@ XlaComputationInOut XlaTranslator::BuildComputationProgram(
         cctx.AddNodeOp(node, xla_output);
         break;
       }
+      case aten::size: {
+        XLA_CHECK_EQ(node->inputs().size(), 1);
+        std::vector<xla::int64> size_op_result;
+        xla::XlaOp xla_output =
+            BuildSize(node, cctx.OpForInput(node, 0), &size_op_result);
+        cctx.AddSizeOpResult(node->output(0), size_op_result);
+        cctx.AddNodeOp(node, xla_output);
+        break;
+      }
       case prim::Constant: {
         cctx.AddNodeOp(node, GetConstantOp(b, node));
         break;
@@ -498,6 +537,13 @@ XlaComputationInOut XlaTranslator::BuildComputationProgram(
       }
       case prim::Undefined: {
         cctx.AddUndefinedInput(ComputationContext::OutputId(node));
+        break;
+      }
+      case prim::SumToSize: {
+        XLA_CHECK_EQ(node->inputs().size(), 2);
+        xla::XlaOp xla_output = BuildSumToSize(node, cctx.OpForInput(node, 0),
+                                               cctx.GetSizeOpValues());
+        cctx.AddNodeOp(node, xla_output);
         break;
       }
       default:
@@ -511,10 +557,23 @@ XlaComputationInOut XlaTranslator::BuildComputationProgram(
     AT_ERROR("Unexpected end of graph");
   }
   std::vector<xla::XlaOp> returned_tuple;
-  for (const auto return_input : node_inputs) {
+  XlaComputationInOut::SizeOpValues ret_size_op_values;
+  for (size_t return_input_idx = 0; return_input_idx < node_inputs.size();
+       ++return_input_idx) {
+    const auto return_input = node_inputs[return_input_idx];
+    const auto size_op_value_maybe =
+        cctx.GetSizeOpValueForId(return_input->unique());
+    // Add evaluated aten::size values to the return tuple.
+    if (size_op_value_maybe) {
+      const auto it_ok =
+          ret_size_op_values.emplace(return_input_idx, *size_op_value_maybe);
+      XLA_CHECK(it_ok.second)
+          << "Duplicated return component index " << return_input_idx;
+    }
     returned_tuple.push_back(cctx.GetOpForValue(return_input));
   }
-  return XlaComputationInOut{cctx.ReleaseInputs(), returned_tuple};
+  return XlaComputationInOut{cctx.ReleaseInputs(), std::move(returned_tuple),
+                             std::move(ret_size_op_values)};
 }
 
 }  // namespace jit

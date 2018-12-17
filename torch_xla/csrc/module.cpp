@@ -7,9 +7,10 @@
 #include "cross_replica_reduces.h"
 #include "passes/eval_static_size.h"
 #include "passes/insert_explicit_expand.h"
+#include "passes/remove_in_place_out_param_ops.h"
 #include "passes/remove_unused_forward_outputs.h"
+#include "passes/replace_in_place_ops.h"
 #include "passes/replace_untraced_operators.h"
-#include "passes/set_mat_mul_output_shape.h"
 #include "passes/threshold_backward_peephole.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/xla_util.h"
@@ -18,6 +19,7 @@
 #include "torch/csrc/jit/passes/constant_propagation.h"
 #include "torch/csrc/jit/passes/dead_code_elimination.h"
 #include "torch/csrc/jit/passes/lower_tuples.h"
+#include "torch/csrc/jit/passes/shape_analysis.h"
 #include "torch/csrc/jit/passes/specialize_undef.h"
 
 namespace torch {
@@ -51,6 +53,20 @@ XlaModule::TensorBatchVector CreateResultBatchVector(
   return batch_tensors;
 }
 
+// Returns the number of real outputs from the forward graph pointed to by
+// df_input_vjps. df_input_vjps contains an ordered subset of the full real
+// outputs set, followed by an ordered subset of the additional outputs.
+size_t InputVjpsRealOutputCount(const Gradient& gradient) {
+  size_t real_output_count = 0;
+  for (; real_output_count < gradient.df_input_vjps.size();
+       ++real_output_count) {
+    if (gradient.df_input_vjps[real_output_count] >= gradient.f_real_outputs) {
+      break;
+    }
+  }
+  return real_output_count;
+}
+
 }  // namespace
 
 XlaModule::XlaModule(const std::shared_ptr<script::Module> module,
@@ -70,11 +86,12 @@ void XlaModule::Initialize(const TensorBatchVector& inputs) {
   std::shared_ptr<Graph> forward_graph = forward->graph()->copy();
   // Run forward passes.
   CanonicalizeOps(forward_graph);
-  SetMatMulOutputShape(forward_graph);
   InsertExplicitExpand(forward_graph);
   EvalStaticSize(forward_graph);
   ConstantPropagation(forward_graph);
   ReplaceUntracedOperators(forward_graph);
+  RemoveInPlaceOutParamOps(forward_graph);
+  ReplaceInPlaceOps(forward_graph);
   EliminateDeadCode(forward_graph);
 
   // Convert model parameters to vector of XLATensors.
@@ -99,8 +116,8 @@ void XlaModule::Initialize(const TensorBatchVector& inputs) {
     optimizable_params_.push_back(std::move(optimizable_replica_params));
   }
   if (!differentiate_) {
-    f_ = forward_graph;
-    f_real_outputs_ = f_->outputs().size();
+    gradient_.f = forward_graph;
+    gradient_.f_real_outputs = forward_graph->outputs().size();
     return;
   }
   // Collect the requires-gradient property making sure all the replica inputs
@@ -126,39 +143,27 @@ void XlaModule::Initialize(const TensorBatchVector& inputs) {
   // Automatically differentiate the forward graph to get the backward graph.
   // Since differentiation is mutating the graph, do it on a copy.
   auto forward_graph_copy = forward_graph->copy();
-  Gradient gradient = differentiate(forward_graph_copy);
+  gradient_ = differentiate(forward_graph_copy);
 
   // Run the forward passes.
-  CanonicalizeOps(gradient.f);
-  InsertExplicitExpand(gradient.f);
-  EvalStaticSize(gradient.f);
-  ConstantPropagation(gradient.f);
-  ReplaceUntracedOperators(gradient.f);
-  EliminateDeadCode(gradient.f);
+  CanonicalizeOps(gradient_.f);
+  InsertExplicitExpand(gradient_.f);
+  ConstantPropagation(gradient_.f);
+  ReplaceUntracedOperators(gradient_.f);
+  EliminateDeadCode(gradient_.f);
   // Run the backward passes.
-  specializeUndef(*(gradient.df.get()));
-  EvalStaticSize(gradient.df);
-  ConstantPropagation(gradient.df);
-  ThresholdBackwardPeephole(gradient.df);
-  EliminateDeadCode(gradient.df);
-  LowerAllTuples(gradient.df);
+  specializeUndef(*(gradient_.df.get()));
+  ConstantPropagation(gradient_.df);
+  ThresholdBackwardPeephole(gradient_.df);
+  EliminateDeadCode(gradient_.df);
+  LowerAllTuples(gradient_.df);
   // Run pass on forward and backward graphs that drops outputs that XLA doesn't
   // need.
-  RemoveUnusedForwardOutputs(gradient);
+  RemoveUnusedForwardOutputs(&gradient_);
 
-  // Record the number of outputs for the forward computation and the captured
-  // input and output indices to be used by the backward computation.
-  f_real_outputs_ = gradient.f_real_outputs;
-  df_input_captured_inputs_ = gradient.df_input_captured_inputs;
-  df_input_captured_outputs_ = gradient.df_input_captured_outputs;
-
-  // Take ownership of the forward and differentiated graphs and release the
-  // reference to the script module to mark initialization as done.
-  f_ = gradient.f;
-  df_ = gradient.df;
-  TF_VLOG(4) << "Gradient F:\n" << f_->toString();
-  TF_VLOG(4) << "Gradient DF:\n" << df_->toString();
-  // Mark the module as initialized.
+  TF_VLOG(4) << "Gradient F:\n" << gradient_.f->toString();
+  TF_VLOG(4) << "Gradient DF:\n" << gradient_.df->toString();
+  // Release the reference to the script module to mark initialization as done.
   script_module_ = nullptr;
 }
 
@@ -173,7 +178,7 @@ XlaModule::TensorBatchVector XlaModule::forward(
     const TensorBatchVector& inputs) {
   Initialize(inputs);
   if (!backward_input_gradients_.empty()) {
-    const auto return_node = df_->return_node();
+    const auto return_node = gradient_.df->return_node();
     const auto node_inputs = return_node->inputs();
     if (!node_inputs.empty()) {
       return RunFusedTrain(inputs);
@@ -199,7 +204,7 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
     // We already have the gradients from the fused computation, just set the
     // gradients for input and parameters.
     ApplyGradients(grad_inputs_, inputs_, optimizable_params_,
-                   inputs_require_grad_, *df_);
+                   inputs_require_grad_, *gradient_.df);
     return;
   }
   // NOTE: The order of the input parameters passed to the BuildComputation()
@@ -217,9 +222,20 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
         zero_input.push_back(false);
       }
     }
-    for (auto p : captured_outputs_[i]) {
-      // TODO(asuhan): Remove the all zero grad outputs from the forward trace
-      // output.
+    const auto& replica_captured_outputs = captured_outputs_[i];
+    const auto input_vjps_real_outputs = InputVjpsRealOutputCount(gradient_);
+    XLA_CHECK_EQ(input_vjps_real_outputs, replica_raw_grad_outputs.size());
+    for (size_t input_vjp_idx = input_vjps_real_outputs;
+         input_vjp_idx < gradient_.df_input_vjps.size(); ++input_vjp_idx) {
+      const auto raw_output_index = gradient_.df_input_vjps[input_vjp_idx];
+      // The index in gradient_.df_input_vjps points inside all outputs list,
+      // both real and captured. Skip the real output count to get the captured
+      // output index.
+      XLA_CHECK_GE(raw_output_index, input_vjps_real_outputs);
+      XLA_CHECK_LT(raw_output_index - input_vjps_real_outputs,
+                   replica_captured_outputs.size());
+      auto p =
+          replica_captured_outputs[raw_output_index - input_vjps_real_outputs];
       replica_raw_grad_outputs.push_back(p);
       if (i == 0) {
         zero_input.push_back(true);
@@ -247,10 +263,13 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
           replica_raw_grad_outputs[j]->shape(), kind));
     }
 
-    XlaTranslator xla_bwd_impl(df_, GetPrecisionConfig());
+    XlaTranslator xla_bwd_impl(gradient_.df, GetPrecisionConfig());
     backward_computation_ =
-        xla_bwd_impl.BuildComputation("XlaBackward", backward_shapes,
-                                      GetBackwardBuildOptions(inputs_.size()));
+        xla_bwd_impl
+            .BuildComputation("XlaBackward", backward_shapes,
+                              backward_size_op_values_,
+                              GetBackwardBuildOptions(inputs_.size()))
+            .computation;
     backward_shape_.reset();
   }
   // Collect the computation client data vector.
@@ -265,7 +284,7 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
               *backward_shape_);
 
   ApplyGradients(grad_inputs, inputs_, optimizable_params_,
-                 inputs_require_grad_, *df_);
+                 inputs_require_grad_, *gradient_.df);
   // Release handles to saved / captured inputs and outputs.
   inputs_.clear();
   captured_outputs_.clear();
@@ -328,18 +347,19 @@ XlaModule::TensorBatchVector XlaModule::RunFusedTrain(
       Execute(*forward_computation_, inputs_params_buffers_data, devices_,
               *forward_shape_);
 
-  // First f_real_outputs_ are the forward outputs returned to user code.
-  XLA_CHECK_LE(f_real_outputs_, result_components.front().size());
+  // First gradient_.f_real_outputs are the forward outputs returned to user
+  // code.
+  XLA_CHECK_LE(gradient_.f_real_outputs, result_components.front().size());
   grad_inputs_.clear();
   TensorBatchVector forward_result;
   for (auto& replica_result_components : result_components) {
     TensorBatchVector::value_type replica_forward_result;
     TensorBatchVector::value_type replica_grad_inputs;
-    for (size_t j = 0; j < f_real_outputs_; ++j) {
+    for (size_t j = 0; j < gradient_.f_real_outputs; ++j) {
       replica_forward_result.push_back(replica_result_components[j]);
     }
-    for (size_t j = f_real_outputs_; j < replica_result_components.size();
-         ++j) {
+    for (size_t j = gradient_.f_real_outputs;
+         j < replica_result_components.size(); ++j) {
       replica_grad_inputs.push_back(replica_result_components[j]);
     }
     forward_result.push_back(std::move(replica_forward_result));
@@ -365,28 +385,25 @@ xla::PrecisionConfig::Precision XlaModule::GetPrecisionConfig() const {
 
 void XlaModule::BuildFusedTrainComputation(
     const std::vector<XlaTranslator::ParameterShape>& forward_shapes) {
-  XlaTranslator xla_fwd_impl(f_, GetPrecisionConfig());
+  XlaTranslator xla_fwd_impl(gradient_.f, GetPrecisionConfig());
   xla::XlaBuilder b("XlaFusedComputation");
   // Build the forward pass program without compiling it, the backward pass
   // needs to be called before finalizing it.
-  auto computation_in_outs =
-      xla_fwd_impl.BuildComputationProgram(forward_shapes, &b);
+  auto computation_in_outs = xla_fwd_impl.BuildComputationProgram(
+      forward_shapes, backward_size_op_values_, &b);
   // Take the XLA outputs from the forward pass and set them for the backward
   // call in the same order the standalone, unfused version takes its arguments.
   XLA_CHECK(!computation_in_outs.outputs.empty());
-  XLA_CHECK_EQ(f_real_outputs_, backward_input_gradients_.size());
-  std::vector<xla::XlaOp> captured_outputs;
-  for (size_t i = f_real_outputs_; i < computation_in_outs.outputs.size();
-       i++) {
-    captured_outputs.push_back(computation_in_outs.outputs[i]);
-  }
+  XLA_CHECK_EQ(gradient_.f_real_outputs, backward_input_gradients_.size());
   std::vector<xla::XlaOp> captured_inputs_outputs;
-  for (auto i : df_input_captured_inputs_) {
+  for (auto i : gradient_.df_input_captured_inputs) {
     captured_inputs_outputs.push_back(computation_in_outs.inputs[i]);
   }
-  for (auto i : df_input_captured_outputs_) {
+  for (auto i : gradient_.df_input_captured_outputs) {
     captured_inputs_outputs.push_back(computation_in_outs.outputs[i]);
   }
+  backward_size_op_values_ = SetBackwardSizeOpValues(
+      computation_in_outs.ret_size_op_values, gradient_);
   // NOTE: The order of the input parameters passed to the BuildComputation()
   // call to build the backward computation is critical, as they have to match
   // the sequence of the graph->inputs() vector. Before the gradients passed in
@@ -403,9 +420,13 @@ void XlaModule::BuildFusedTrainComputation(
         XlaTranslator::ParameterKind::kGraphInput));
     backward_operands.push_back(gradient_op);
   }
-  for (auto p : captured_outputs) {
+  for (size_t input_vjp_idx = backward_input_gradients_.size();
+       input_vjp_idx < gradient_.df_input_vjps.size(); ++input_vjp_idx) {
+    const auto raw_output_index = gradient_.df_input_vjps[input_vjp_idx];
+    XLA_CHECK_LT(raw_output_index, computation_in_outs.outputs.size());
     backward_shapes.push_back(XlaTranslator::ParameterShape(
-        XlaHelpers::ShapeOfXlaOp(p), XlaTranslator::ParameterKind::kZeroInput));
+        XlaHelpers::ShapeOfXlaOp(computation_in_outs.outputs[raw_output_index]),
+        XlaTranslator::ParameterKind::kZeroInput));
   }
   for (auto p : captured_inputs_outputs) {
     backward_shapes.push_back(XlaTranslator::ParameterShape(
@@ -414,16 +435,20 @@ void XlaModule::BuildFusedTrainComputation(
     backward_operands.push_back(p);
   }
   // The arguments are set up correctly, call into the backward computation.
-  XlaTranslator xla_bwd_impl(df_, GetPrecisionConfig());
-  auto backward_computation = xla_bwd_impl.BuildComputation(
-      "XlaBackward", backward_shapes, GetBackwardBuildOptions(inputs_.size()));
+  XlaTranslator xla_bwd_impl(gradient_.df, GetPrecisionConfig());
+  auto backward_computation =
+      xla_bwd_impl
+          .BuildComputation("XlaBackward", backward_shapes,
+                            backward_size_op_values_,
+                            GetBackwardBuildOptions(inputs_.size()))
+          .computation;
   xla::XlaOp backward_op =
       xla::Call(&b, backward_computation, backward_operands);
 
   // Return the real outputs of the forward, followed by the outputs of the
   // backward.
   std::vector<xla::XlaOp> returned_outputs;
-  for (size_t i = 0; i < f_real_outputs_; ++i) {
+  for (size_t i = 0; i < gradient_.f_real_outputs; ++i) {
     returned_outputs.push_back(computation_in_outs.outputs[i]);
   }
   xla::Shape backward_shape = XlaHelpers::ShapeOfXlaOp(backward_op);
@@ -458,9 +483,12 @@ XlaModule::TensorBatchVector XlaModule::RunUnfusedForward(
           p->shape(), XlaTranslator::ParameterKind::kGraphInput));
     }
 
-    XlaTranslator xla_fwd_impl(f_, GetPrecisionConfig());
-    forward_computation_ =
-        xla_fwd_impl.BuildComputation("XlaForward", forward_shapes);
+    XlaTranslator xla_fwd_impl(gradient_.f, GetPrecisionConfig());
+    auto forward_translation_result = xla_fwd_impl.BuildComputation(
+        "XlaForward", forward_shapes, backward_size_op_values_);
+    forward_computation_ = std::move(forward_translation_result.computation);
+    backward_size_op_values_ = SetBackwardSizeOpValues(
+        forward_translation_result.ret_size_op_values, gradient_);
     forward_shape_.reset();
   }
   DataBatchVector inputs_params_buffers_data =
@@ -477,24 +505,25 @@ XlaModule::TensorBatchVector XlaModule::RunUnfusedForward(
   for (size_t i = 0; i < raw_outputs.size(); ++i) {
     auto& replica_raw_outputs = raw_outputs[i];
     TensorBatchVector::value_type replica_outputs;
-    for (size_t j = 0; j < f_real_outputs_; j++) {
+    for (size_t j = 0; j < gradient_.f_real_outputs; j++) {
       replica_outputs.push_back(replica_raw_outputs[j]);
     }
     outputs.push_back(std::move(replica_outputs));
 
     TensorBatchVector::value_type replica_captured_outputs;
-    for (size_t j = f_real_outputs_; j < replica_raw_outputs.size(); j++) {
+    for (size_t j = gradient_.f_real_outputs; j < replica_raw_outputs.size();
+         j++) {
       replica_captured_outputs.push_back(replica_raw_outputs[j]);
     }
     captured_outputs_.push_back(std::move(replica_captured_outputs));
 
     auto& replica_inputs_params_buffers = inputs_params_buffers[i];
     TensorBatchVector::value_type replica_captured_inputs_outputs;
-    for (auto j : df_input_captured_inputs_) {
+    for (auto j : gradient_.df_input_captured_inputs) {
       replica_captured_inputs_outputs.push_back(
           replica_inputs_params_buffers[j]);
     }
-    for (auto j : df_input_captured_outputs_) {
+    for (auto j : gradient_.df_input_captured_outputs) {
       replica_captured_inputs_outputs.push_back(replica_raw_outputs[j]);
     }
     captured_inputs_outputs_.push_back(
@@ -557,8 +586,7 @@ XlaTranslator::BuildOptions XlaModule::GetBackwardBuildOptions(
     size_t num_replicas) {
   XlaTranslator::BuildOptions options;
   if (num_replicas > 1) {
-    options.output_transform = [this, num_replicas](const xla::XlaOp& op,
-                                                    size_t) {
+    options.output_transform = [num_replicas](const xla::XlaOp& op, size_t) {
       return BuildCrossReplicaSum(op, num_replicas);
     };
   }
@@ -572,6 +600,35 @@ void XlaModule::FlushTensorsOperations() {
   // have a path leading to the same XLA computation.
   std::vector<std::shared_ptr<XLATensor>> tensors = XLATensor::GetLiveTensors();
   XLATensor::ApplyPendingGraph(tensors);
+}
+
+XlaComputationInOut::SizeOpValues XlaModule::SetBackwardSizeOpValues(
+    const XlaComputationInOut::SizeOpValues& ret_size_op_values,
+    const Gradient& gradient) {
+  size_t backward_input_idx = 0;
+  XlaComputationInOut::SizeOpValues backward_size_op_values;
+  for (const auto out_idx : gradient.df_input_vjps) {
+    const auto ret_size_op_value_it = ret_size_op_values.find(out_idx);
+    if (ret_size_op_value_it != ret_size_op_values.end()) {
+      const auto it_ok = backward_size_op_values.emplace(
+          backward_input_idx, ret_size_op_value_it->second);
+      XLA_CHECK(it_ok.second)
+          << "Duplicated backward_input_idx: " << backward_input_idx;
+    }
+    ++backward_input_idx;
+  }
+  backward_input_idx += gradient.df_input_captured_inputs.size();
+  for (const auto out_idx : gradient.df_input_captured_outputs) {
+    const auto ret_size_op_value_it = ret_size_op_values.find(out_idx);
+    if (ret_size_op_value_it != ret_size_op_values.end()) {
+      const auto it_ok = backward_size_op_values.emplace(
+          backward_input_idx, ret_size_op_value_it->second);
+      XLA_CHECK(it_ok.second)
+          << "Duplicated backward_input_idx: " << backward_input_idx;
+    }
+    ++backward_input_idx;
+  }
+  return backward_size_op_values;
 }
 
 XlaModule::DataBatchVector XlaModule::GetDataBatchVector(

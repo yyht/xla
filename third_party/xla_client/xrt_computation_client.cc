@@ -9,6 +9,7 @@
 #include "tensorflow/compiler/xla/shape_util.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "tensorflow/compiler/xla/xla_client/multi_wait.h"
+#include "tensorflow/compiler/xla/xla_client/sys_util.h"
 #include "tensorflow/compiler/xla/xla_client/thread_pool.h"
 #include "tensorflow/compiler/xla/xla_client/unique.h"
 #include "tensorflow/compiler/xla/xla_client/xla_util.h"
@@ -101,7 +102,7 @@ XrtComputationClient::TransferToServer(
   std::vector<std::shared_ptr<Data>> results(literals.size());
   for (auto& session_work : session_work_map) {
     std::vector<tensorflow::Tensor> outputs;
-    TF_CHECK_OK(session_work.first->session()->Run(
+    XLA_CHECK_OK(session_work.first->session()->Run(
         feed_inputs, session_work.second.outputs_handles, &outputs));
     XLA_CHECK_EQ(outputs.size(), session_work.second.outputs_handles.size());
 
@@ -141,7 +142,7 @@ std::vector<Literal> XrtComputationClient::TransferFromServer(
   std::vector<Literal> results(handles.size());
   for (auto& session_work : session_work_map) {
     std::vector<tensorflow::Tensor> outputs;
-    TF_CHECK_OK(session_work.first->session()->Run(
+    XLA_CHECK_OK(session_work.first->session()->Run(
         feed_inputs, session_work.second.outputs_handles, &outputs));
     XLA_CHECK_EQ(outputs.size(), session_work.second.outputs_handles.size());
 
@@ -227,26 +228,35 @@ XrtComputationClient::RunComputations(
     XrtSession* session = session_map.at(worker_hostport.second).get();
     session_replicas[session].push_back(i);
   }
-  // TODO(dlibenzi): These could be run in parallel.
+
+  xla_util::MultiWait mwait(session_replicas.size());
   std::vector<std::vector<std::shared_ptr<Data>>> results(devices.size());
   for (auto& sess_replica : session_replicas) {
-    std::vector<tensorflow::Output> exec_nodes;
-    for (auto replica : sess_replica.second) {
-      exec_nodes.push_back(exec_ops[replica].execute_output);
-    }
-    std::vector<tensorflow::Tensor> outputs;
-    xrt_util::CheckComputationStatus(
-        sess_replica.first->session()->Run(feed_inputs, exec_nodes, &outputs),
-        computations);
-    XLA_CHECK_EQ(outputs.size(), exec_nodes.size());
+    XrtSession* session = sess_replica.first;
+    const std::vector<size_t>& replicas = sess_replica.second;
 
-    for (size_t i = 0; i < outputs.size(); ++i) {
-      auto replica = sess_replica.second[i];
-      results[replica] =
-          GetComputationResults(outputs[i], exec_ops[replica].result_shape,
-                                GetEffectiveDevice(devices[replica]));
-    }
+    auto session_runner = [&, this, session]() {
+      std::vector<tensorflow::Output> exec_nodes;
+      for (auto replica : replicas) {
+        exec_nodes.push_back(exec_ops[replica].execute_output);
+      }
+      std::vector<tensorflow::Tensor> outputs;
+      xrt_util::CheckComputationStatus(
+          session->session()->Run(feed_inputs, exec_nodes, &outputs),
+          computations);
+      XLA_CHECK_EQ(outputs.size(), exec_nodes.size());
+
+      for (size_t i = 0; i < outputs.size(); ++i) {
+        auto replica = replicas[i];
+        results[replica] =
+            GetComputationResults(outputs[i], exec_ops[replica].result_shape,
+                                  GetEffectiveDevice(devices[replica]));
+      }
+      mwait.Done();
+    };
+    xla_env::ScheduleIoClosure(std::move(session_runner));
   }
+  mwait.Wait();
   return results;
 }
 
@@ -305,7 +315,7 @@ XrtComputationClient::DeconstructTuple(
   std::vector<std::vector<std::shared_ptr<Data>>> results(tuples.size());
   for (auto& session_work : session_work_map) {
     std::vector<tensorflow::Tensor> outputs;
-    TF_CHECK_OK(session_work.first->session()->Run(
+    XLA_CHECK_OK(session_work.first->session()->Run(
         feed_inputs, session_work.second.outputs_handles, &outputs));
     XLA_CHECK_EQ(outputs.size(), session_work.second.outputs_handles.size());
 
@@ -548,7 +558,7 @@ void XrtComputationClient::ReleaseHandles(
   }
   for (const auto& session_releases : session_releases_map) {
     std::vector<tensorflow::Tensor> outputs;
-    TF_CHECK_OK(session_releases.first->session()->Run(
+    XLA_CHECK_OK(session_releases.first->session()->Run(
         session_releases.second.feed_inputs, {},
         session_releases.second.releases, &outputs));
   }
@@ -556,8 +566,10 @@ void XrtComputationClient::ReleaseHandles(
 }
 
 void XrtComputationClient::StartHandleReleaser() {
+  int64 num_threads = sys_util::GetEnvInt("XLA_HANDLE_RELEASE_THREADS",
+                                          options_.device_map.size());
   triggered_task_.reset(
-      new xla_util::TriggeredTask([this]() { HandleReleaser(); }));
+      new xla_util::TriggeredTask([this]() { HandleReleaser(); }, num_threads));
 }
 
 void XrtComputationClient::HandleReleaser() {
@@ -644,12 +656,12 @@ tensorflow::tpu::TopologyProto XrtComputationClient::InitializeAndFetchTopology(
   tensorflow::Node* result;
   session->root()->UpdateStatus(
       builder.Finalize(tpu_system_scope.graph(), &result));
-  TF_CHECK_OK(tpu_system_scope.status());
+  XLA_CHECK_OK(tpu_system_scope.status());
   session->root()->UpdateStatus(tpu_system_scope.DoShapeInference(result));
 
   std::vector<tensorflow::Tensor> outputs;
-  TF_CHECK_OK(session->root()->status());
-  TF_CHECK_OK(
+  XLA_CHECK_OK(session->root()->status());
+  XLA_CHECK_OK(
       session->session()->Run({tensorflow::Output(result, 0)}, &outputs));
   XLA_CHECK_EQ(outputs.size(), 1);
 

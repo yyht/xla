@@ -12,7 +12,7 @@ To build:
 * Checkout the following commit ID:
 
   ```
-  git checkout 1ca0ec7299b9352123a07525320a04e39d657781
+  git checkout e51092a2b89a98fdc4f89f53f2a300bfac718be3
   ```
 
 * Clone the _PyTorch/XLA_ repo:
@@ -27,12 +27,11 @@ To build:
   patch -p1 < xla/pytorch.patch
   ```
 
-* Currently _PyTorch_ does not build with GCC 8.x. A known working GCC version is 7.3.x, so install that in your VM:
+* Currently _PyTorch_ does not build with GCC 6.x, 7.x, and 8.x (various kind of ICEs). CLANG 7.x is known to be working, so install that in your VM:
 
   ```
-  apt-get install gcc-7 g++-7
-  export CC=gcc-7
-  export CXX=g++-7
+  sudo apt-get install clang-7 clang++-7
+  export CC=clang-7 CXX=clang++-7
   ```
   
 * Build _PyTorch_ from source following the regular [instructions](https://github.com/pytorch/pytorch#from-source).

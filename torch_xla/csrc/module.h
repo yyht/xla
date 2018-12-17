@@ -95,6 +95,13 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   // computation have their accumulated operations sync to device memory.
   void FlushTensorsOperations();
 
+  // Propagate ret_size_op_values storing the aten::size values collected during
+  // forward pass translation to the backward pass. Uses the capture information
+  // from the gradient descriptor.
+  static XlaComputationInOut::SizeOpValues SetBackwardSizeOpValues(
+      const XlaComputationInOut::SizeOpValues& ret_size_op_values,
+      const Gradient& gradient);
+
   // Sets the gradients of the optimizeable inputs and the optimizable
   // parameters, according to the grad_inputs values. The inputs_require_grad
   // vector tell which inputs requires the gradient to be updated.
@@ -129,17 +136,14 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   // All the module parameters (which include the optimizable_params_ ones).
   TensorBatchVector all_params_;
   c10::optional<xla::XlaComputation> forward_computation_;
+  // Stores the aten::size values from the forward pass.
+  XlaComputationInOut::SizeOpValues backward_size_op_values_;
   c10::optional<xla::Shape> forward_shape_;
   c10::optional<xla::XlaComputation> backward_computation_;
   c10::optional<xla::Shape> backward_shape_;
 
-  std::shared_ptr<Graph> f_;
-  std::shared_ptr<Graph> df_;
-
-  // info for backwrd captures
-  size_t f_real_outputs_;
-  std::vector<size_t> df_input_captured_inputs_;
-  std::vector<size_t> df_input_captured_outputs_;
+  // Information needed to connect the forward and backward graphs.
+  Gradient gradient_;
 
   // TODO: captured_outputs only needs shape, no need for holding onto full
   // Tensor

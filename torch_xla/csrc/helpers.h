@@ -47,6 +47,9 @@ class XlaHelpers {
   // Returns the shape of the given XLA operation.
   static xla::Shape ShapeOfXlaOp(const xla::XlaOp& op);
 
+  // Returns the list of dimension sizes for the given XLA operation.
+  static std::vector<xla::int64> SizesOfXlaOp(const xla::XlaOp& op);
+
   // Returns the value type of given XLA operation.
   static xla::PrimitiveType TypeOfXlaOp(const xla::XlaOp& op);
 
@@ -65,9 +68,6 @@ class XlaHelpers {
   // Creates a convolution or dot precision configuration.
   static xla::PrecisionConfig BuildPrecisionConfig(
       const xla::PrecisionConfig::Precision conv_precision);
-
-  // Returns the dimension sizes for the given tensor.
-  static std::vector<int64_t> TensorDimensionSizes(const Value* tensor);
 
   // Converts int64_t's to XLA int64's.
   static std::vector<xla::int64> I64List(const at::IntList& input);
