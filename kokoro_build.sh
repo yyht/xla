@@ -38,9 +38,6 @@ sudo apt-get -y --purge autoremove mpi-default-bin
 sudo apt-get -y --purge autoremove mpi-default-dev
 sudo apt-get -y --purge autoremove openmpi-bin
 
-#TODO(jysohn) remove after oneshot
-cd ..
-
 # Initialize all third_party submodules
 git submodule update --init --recursive
 
@@ -62,19 +59,19 @@ conda install -y numpy pyyaml mkl mkl-include setuptools cmake cffi typing bazel
 
 # Install torch within conda env
 # TODO(jysohn): once pytorch/pytorch JIT bug is fixed install nightly wheel instead
-#sudo /sbin/ldconfig "${HOME}/anaconda3/lib/" "${HOME}/anaconda3/envs/pytorch/lib"
-#pip install ../../../gfile/torch-1.0.0a0+e51092a-cp35-cp35m-linux_x86_64.whl
+sudo /sbin/ldconfig "${HOME}/anaconda3/lib/" "${HOME}/anaconda3/envs/pytorch/lib"
+pip install ../../../gfile/torch-1.0.0a0+d71fac2-cp35-cp35m-linux_x86_64.whl
 
 # Build pytorch-wheel in conda environment
 export NO_CUDA=1
 python setup.py bdist_wheel
 
 # Artifacts for pytorch-tpu wheel build collected (as nightly and with date)
-#ls -lah dist
-#mkdir build_artifacts
-#cp dist/* build_artifacts
-#cd dist && rename "s/\+\w{7}/\+nightly/" *.whl && cd ..
-#cd build_artifacts && rename "s/^torch_xla/torch_xla-$(date -d "yesterday" +%Y%m%d)/" *.whl && cd ..
-#mv dist/* build_artifacts
-#mv build_artifacts/* ../../../
+ls -lah dist
+mkdir build_artifacts
+cp dist/* build_artifacts
+cd dist && rename "s/\+\w{7}/\+nightly/" *.whl && cd ..
+cd build_artifacts && rename "s/^torch_xla/torch_xla-$(date -d "yesterday" +%Y%m%d)/" *.whl && cd ..
+mv dist/* build_artifacts
+mv build_artifacts/* ../../../
 
