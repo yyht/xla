@@ -19,7 +19,7 @@ cd pytorch
 git submodule update --init --recursive
 
 # TODO(jysohn): remove following patching once pytorch JIT bug is fixed
-git checkout e51092a2b89a98fdc4f89f53f2a300bfac718be3
+git checkout d71fac20ebf6b393e464d312b8a38ae1c45c3386
 git apply xla/pytorch.patch
 
 # Execute build
