@@ -34,5 +34,7 @@ xla::XlaOp BuildCat(const Node* node,
 // "dim" attribute of the given node.
 std::vector<xla::XlaOp> BuildChunk(const Node* node, const xla::XlaOp& input);
 
+std::vector<const Value*> InputListAttr(const Node* parent, const size_t id);
+
 }  // namespace jit
 }  // namespace torch

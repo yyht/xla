@@ -652,6 +652,7 @@ class TestAxPlusBGen(XlaTestCase):
 
 class TestAxPlusBGenXla(XlaTestCase):
 
+  @unittest.skip('Fused forward and backward not supported yet for op-by-op')
   def test(self):
     batch_size = 128
     scaler = torch.Tensor([[1.0 / batch_size]])

@@ -76,6 +76,8 @@ class XlaTranslator {
   xla::PrecisionConfig::Precision conv_precision_;
 };
 
+xla::XlaOp GetConstantOp(xla::XlaBuilder* builder, Node* node);
+
 xla::ComputationClient* XlaGetClient();
 
 }  // namespace jit

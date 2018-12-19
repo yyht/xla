@@ -51,6 +51,14 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   // backward, when we first create the fused computation.
   void SetInputGradientsForFusion(std::vector<at::Tensor> gradients);
 
+  // Computes the optimal result shape for a given computation and inputs.
+  static xla::Shape GetResultShape(const xla::XlaComputation& computation,
+                                   const TensorBatchVector& input_tensors);
+
+  // Retrieves the module devices as vector of strings representations, so that
+  // it can be passed to the computation client API.
+  std::vector<std::string> GetStringDevices() const;
+
  private:
   // The i-th entry in this vector, is a vector of XLA computation data which
   // belong the i-th replica.
@@ -62,10 +70,6 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   void CheckInitialized() const;
 
   xla::PrecisionConfig::Precision GetPrecisionConfig() const;
-
-  // Retrieves the module devices as vector of strings representations, so that
-  // it can be passed to the computation client API.
-  std::vector<std::string> GetStringDevices() const;
 
   // Builds the fused forward and backward computation for RunFusedTrain.
   xla::XlaComputation BuildFusedTrainComputation(
@@ -137,9 +141,14 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   static std::vector<XLATensor::Device> CommonDevicesForReplicas(
       const TensorBatchVector& inputs);
 
-  // Computes the optimal result shape for a given computation and inputs.
-  static xla::Shape GetResultShape(const xla::XlaComputation& computation,
-                                   const TensorBatchVector& input_tensors);
+  struct OpByOpExecutionResult {
+    TensorBatchVector tensors;
+    XlaComputationInOut::SizeOpValues ret_size_op_values;
+  };
+
+  OpByOpExecutionResult ExecuteOpByOp(const TensorBatchVector& inputs,
+                                      const std::vector<bool>& zero_input,
+                                      Graph* graph);
 
   // The devices where the replicas should be running. Replica 'i' on
   // devices_[i].

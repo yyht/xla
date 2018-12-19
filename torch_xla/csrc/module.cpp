@@ -3,15 +3,25 @@
 
 #include <algorithm>
 #include <set>
+#include "batch_norm.h"
 #include "c10/util/Exception.h"
+#include "convolution.h"
 #include "cross_replica_reduces.h"
+#include "data_ops.h"
+#include "elementwise.h"
+#include "log_softmax.h"
+#include "nll_loss.h"
 #include "passes/eval_static_size.h"
 #include "passes/remove_in_place_out_param_ops.h"
 #include "passes/remove_unused_forward_outputs.h"
 #include "passes/replace_in_place_ops.h"
 #include "passes/replace_untraced_operators.h"
 #include "passes/threshold_backward_peephole.h"
+#include "pooling.h"
+#include "reduction.h"
+#include "size_ops.h"
 #include "tensorflow/compiler/xla/xla_client/debug_macros.h"
+#include "tensorflow/compiler/xla/xla_client/sys_util.h"
 #include "tensorflow/compiler/xla/xla_client/xla_util.h"
 #include "torch/csrc/jit/passes/canonicalize_ops.h"
 #include "torch/csrc/jit/passes/common_subexpression_elimination.h"
@@ -193,7 +203,411 @@ XlaModule::TensorBatchVector XlaModule::forward(
   return RunUnfusedForward(inputs);
 }
 
+namespace {
+
+class OpByOpContext {
+ public:
+  std::shared_ptr<XLATensor> GetTensorForInput(const Node* node,
+                                               size_t input_index) const {
+    const auto input = node->input(input_index);
+    auto it = node_tensors_.find(input->unique());
+    XLA_CHECK(it != node_tensors_.end())
+        << "Input " << input_index << " of " << *node << " not found";
+    return it->second;
+  }
+
+  std::shared_ptr<XLATensor> GetTensorForId(size_t id) const {
+    auto it = node_tensors_.find(id);
+    XLA_CHECK(it != node_tensors_.end())
+        << "Node with id " << id << " not found";
+    return it->second;
+  }
+
+  c10::optional<std::shared_ptr<XLATensor>> GetTensorForInputMaybe(
+      const Node* node, size_t input_index) const {
+    const auto input = node->input(input_index);
+    if (undefined_inputs_.find(input->unique()) != undefined_inputs_.end()) {
+      return c10::nullopt;
+    }
+    return GetTensorForId(input->unique());
+  }
+
+  void AddTensorForId(const size_t id, std::shared_ptr<XLATensor> tensor) {
+    const auto it_ok = node_tensors_.emplace(id, tensor);
+    XLA_CHECK(it_ok.second) << "Duplicated tensor id " << id;
+  }
+
+  void AddUndefinedInput(size_t index) { undefined_inputs_.insert(index); }
+
+ private:
+  std::unordered_map<size_t, std::shared_ptr<XLATensor>> node_tensors_;
+  std::unordered_set<size_t> undefined_inputs_;
+};
+
+void DispatchOneOp(const Node* node, const std::vector<XLATensor*>& operands,
+                   const XlaModule::TensorBatchVector& inputs,
+                   OpByOpContext* ctx, xla::XlaBuilder* b,
+                   const XlaModule* module) {
+  auto xla_computation = b->Build().ValueOrDie();
+  xla::Shape result_shape = XlaModule::GetResultShape(xla_computation, inputs);
+  const auto computation = XlaGetClient()->Compile(
+      std::move(xla_computation), module->GetStringDevices(), &result_shape);
+  std::vector<xla::ComputationClient::Data*> arguments;
+  for (const auto operand : operands) {
+    arguments.push_back(operand->CurrentXlaData().get());
+  }
+  xla::ComputationClient::ExecuteComputationOptions execute_options;
+  const auto result = XlaGetClient()->ExecuteComputation(
+      *computation, arguments, computation->devices()[0], execute_options);
+  XLA_CHECK_LE(result.size(), node->outputs().size())
+      << "Unexpected result size " << result.size();
+  for (size_t i = 0; i < result.size(); ++i) {
+    ctx->AddTensorForId(node->output(i)->unique(),
+                        XLATensor::Create(result[i], false));
+  }
+}
+
+struct BinaryOpByOpInputs {
+  std::shared_ptr<XLATensor> lhs;
+  std::shared_ptr<XLATensor> rhs;
+  xla::XlaOp xla_lhs;
+  xla::XlaOp xla_rhs;
+};
+
+BinaryOpByOpInputs GetBinaryOpByOpInputs(
+    const Node* node, const std::unordered_map<size_t, Node*>& constant_nodes,
+    const OpByOpContext& ctx, xla::XlaBuilder* b) {
+  XLA_CHECK_GE(node->inputs().size(), 2);
+  const auto lhs_const_it = constant_nodes.find(node->input(0)->unique());
+  const auto rhs_const_it = constant_nodes.find(node->input(1)->unique());
+  const auto lhs = lhs_const_it == constant_nodes.end()
+                       ? ctx.GetTensorForInput(node, 0)
+                       : nullptr;
+  const auto rhs = rhs_const_it == constant_nodes.end()
+                       ? ctx.GetTensorForInput(node, 1)
+                       : nullptr;
+  const auto xla_lhs = lhs ? xla::Parameter(b, 0, lhs->shape(), "param_0")
+                           : GetConstantOp(b, lhs_const_it->second);
+  size_t second_param_idx = lhs ? 1 : 0;
+  const auto xla_rhs =
+      rhs ? xla::Parameter(b, second_param_idx, rhs->shape(),
+                           "param_" + std::to_string(second_param_idx))
+          : GetConstantOp(b, rhs_const_it->second);
+  return {lhs, rhs, xla_lhs, xla_rhs};
+}
+
+std::vector<XLATensor*> GetBinaryOpByOpTensorOperands(
+    const BinaryOpByOpInputs& binary_op_by_op_inputs) {
+  std::vector<XLATensor*> operands;
+  if (binary_op_by_op_inputs.lhs) {
+    operands.push_back(binary_op_by_op_inputs.lhs.get());
+  }
+  if (binary_op_by_op_inputs.rhs) {
+    operands.push_back(binary_op_by_op_inputs.rhs.get());
+  }
+  return operands;
+}
+
+}  // namespace
+
+XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
+    const TensorBatchVector& inputs, const std::vector<bool>& zero_input,
+    Graph* graph) {
+  const auto graph_inputs = graph->inputs();
+  XLA_CHECK((zero_input.empty() && graph_inputs.size() == inputs[0].size()) ||
+            (zero_input.size() == graph_inputs.size()))
+      << "Graph:\n"
+      << graph->toString();
+  // TODO(asuhan)
+  XLA_CHECK_EQ(inputs.size(), 1)
+      << "Op-by-op not supported in replicated mode yet";
+  auto nodes = graph->block()->nodes();
+  OpByOpContext ctx;
+  for (size_t parameter_number = 0; parameter_number < graph_inputs.size();
+       ++parameter_number) {
+    ctx.AddTensorForId(graph_inputs[parameter_number]->unique(),
+                       inputs[0][parameter_number]);
+  }
+  size_t node_idx = 0;
+  XlaComputationInOut::SizeOpValues size_op_values;
+  std::unordered_map<size_t, Node*> constant_nodes;
+  for (const auto node : nodes) {
+    xla::XlaBuilder b("node_" + std::to_string(node_idx));
+    b.set_die_immediately_on_error(true);
+    switch (node->kind()) {
+      case aten::add:
+      case aten::sub:
+      case aten::mul: {
+        const auto binary_op_by_op_inputs =
+            GetBinaryOpByOpInputs(node, constant_nodes, ctx, &b);
+        xla::PrecisionConfig precision_config =
+            XlaHelpers::BuildPrecisionConfig(GetPrecisionConfig());
+        BuildArithmeticOp(node, binary_op_by_op_inputs.xla_lhs,
+                          binary_op_by_op_inputs.xla_rhs);
+        const auto operands =
+            GetBinaryOpByOpTensorOperands(binary_op_by_op_inputs);
+        DispatchOneOp(node, operands, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::convolution:
+      case aten::thnn_conv2d_forward: {
+        if (node->inputs().size() < 3) {
+          AT_ERROR("Unsupported number of inputs for convolution: ",
+                   node->inputs().size());
+        }
+
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto kernel = ctx.GetTensorForInput(node, 1);
+        const auto bias_maybe = ctx.GetTensorForInputMaybe(node, 3);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        const auto xla_kernel =
+            xla::Parameter(&b, 1, kernel->shape(), "param_1");
+        if (bias_maybe) {  // bias exists
+          const auto bias = *bias_maybe;
+          const auto xla_bias = xla::Parameter(&b, 2, bias->shape(), "param_2");
+          BuildConvolutionBias(node, xla_input, xla_kernel, xla_bias,
+                               GetPrecisionConfig());
+          DispatchOneOp(node, {input.get(), kernel.get(), bias.get()}, inputs,
+                        &ctx, &b, this);
+        } else {
+          BuildConvolution(node, xla_input, xla_kernel, GetPrecisionConfig());
+          DispatchOneOp(node, {input.get(), kernel.get()}, inputs, &ctx, &b,
+                        this);
+        }
+        break;
+      }
+      case aten::t: {
+        XLA_CHECK_EQ(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        xla::Transpose(xla_input, {1, 0});
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::mm: {
+        const auto binary_op_by_op_inputs =
+            GetBinaryOpByOpInputs(node, constant_nodes, ctx, &b);
+        xla::PrecisionConfig precision_config =
+            XlaHelpers::BuildPrecisionConfig(GetPrecisionConfig());
+        xla::Dot(binary_op_by_op_inputs.xla_lhs, binary_op_by_op_inputs.xla_rhs,
+                 &precision_config);
+        const auto operands =
+            GetBinaryOpByOpTensorOperands(binary_op_by_op_inputs);
+        DispatchOneOp(node, operands, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::max_pool2d_with_indices: {
+        XLA_CHECK_GE(node->inputs().size(), 1);
+        XLA_CHECK_GE(node->outputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildMaxPool2d(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::avg_pool2d: {
+        XLA_CHECK_GE(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildAvgPool2d(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::tanh: {
+        XLA_CHECK_EQ(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        Tanh(xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::sigmoid: {
+        CHECK_EQ(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        const auto half = XlaHelpers::ScalarValue<float>(
+            0.5, input->shape().element_type(), &b);
+        xla::XlaOp xla_output = half + half * Tanh(half * xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::relu: {
+        XLA_CHECK_EQ(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        xla::Shape xla_input_shape = XlaHelpers::ShapeOfXlaOp(xla_input);
+        xla::Max(xla_input, XlaHelpers::ScalarValue<float>(
+                                0, xla_input_shape.element_type(), &b));
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::threshold: {
+        XLA_CHECK_EQ(node->inputs().size(), 3);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto output = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        const auto xla_output =
+            xla::Parameter(&b, 1, output->shape(), "param_1");
+        BuildThreshold(
+            node, xla_input, xla_output,
+            node->get<at::Scalar>(attr::threshold).value().to<float>(),
+            node->get<at::Scalar>(attr::value).value().to<float>(), &b);
+        DispatchOneOp(node, {input.get(), output.get()}, inputs, &ctx, &b,
+                      this);
+        break;
+      }
+      case aten::log_softmax: {
+        XLA_CHECK_EQ(node->inputs().size(), size_t(2));
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildLogSoftmax(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::reshape:
+      case aten::view: {
+        XLA_CHECK_EQ(node->inputs().size(), 2);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildView(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::expand: {
+        XLA_CHECK_GE(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildExpand(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::stack: {
+        XLA_CHECK_EQ(node->inputs().size(), 2);
+        std::vector<std::shared_ptr<XLATensor>> operands_owned;
+        std::vector<xla::XlaOp> xla_operands;
+        const auto stack_inputs = InputListAttr(node, node->input(0)->unique());
+        for (size_t i = 0; i < stack_inputs.size(); ++i) {
+          const auto input = ctx.GetTensorForId(stack_inputs[i]->unique());
+          operands_owned.push_back(input);
+          xla_operands.push_back(xla::Parameter(&b, i, input->shape(),
+                                                "param_" + std::to_string(i)));
+        }
+        BuildStack(
+            node,
+            [&xla_operands, stack_inputs](const Value* val) -> xla::XlaOp {
+              const auto it =
+                  std::find(stack_inputs.begin(), stack_inputs.end(), val);
+              XLA_CHECK(it != stack_inputs.end());
+              return xla_operands[it - stack_inputs.begin()];
+            },
+            &b);
+        std::vector<XLATensor*> operands;
+        for (const auto& operand : operands_owned) {
+          operands.push_back(operand.get());
+        }
+        DispatchOneOp(node, operands, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::native_batch_norm:
+      case aten::batch_norm: {
+        XLA_CHECK_EQ(node->inputs().size(), 8);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto weight = ctx.GetTensorForInput(node, 1);
+        const auto bias = ctx.GetTensorForInput(node, 2);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        const auto xla_weight =
+            xla::Parameter(&b, 1, weight->shape(), "param_1");
+        const auto xla_bias = xla::Parameter(&b, 2, bias->shape(), "param_2");
+        const auto batch_norm_output =
+            BuildBatchNorm(node, xla_input, xla_weight, xla_bias);
+        XlaHelpers::CreateReturnValue(
+            &b, {batch_norm_output.output, batch_norm_output.save_mean,
+                 batch_norm_output.save_invstd_eps});
+        DispatchOneOp(node, {input.get(), weight.get(), bias.get()}, inputs,
+                      &ctx, &b, this);
+        break;
+      }
+      case aten::sum: {
+        XLA_CHECK_GE(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildSum(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::nll_loss: {
+        XLA_CHECK_EQ(node->inputs().size(), 5);
+        const auto logits = ctx.GetTensorForInput(node, 0);
+        const auto xla_logits =
+            xla::Parameter(&b, 0, logits->shape(), "param_0");
+        const auto labels = ctx.GetTensorForInput(node, 1);
+        const auto xla_labels =
+            xla::Parameter(&b, 1, labels->shape(), "param_1");
+        BuildNllLoss(node, xla_logits, xla_labels);
+        DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b,
+                      this);
+        break;
+      }
+      case aten::size: {
+        XLA_CHECK_EQ(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        std::vector<xla::int64> size_op_result;
+        BuildSize(node, xla_input, &size_op_result);
+        const auto it_ok =
+            size_op_values.emplace(node->output(0)->unique(), size_op_result);
+        XLA_CHECK(it_ok.second)
+            << "Duplicated aten::size id: " << node->output(0)->uniqueName();
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case prim::Constant: {
+        const auto it_ok =
+            constant_nodes.emplace(node->output(0)->unique(), node);
+        XLA_CHECK(it_ok.second) << "Duplicated prim::Constant id: "
+                                << node->output(0)->uniqueName();
+        break;
+      }
+      case prim::ListConstruct: {
+        break;
+      }
+      case prim::Undefined: {
+        ctx.AddUndefinedInput(node->output(0)->unique());
+        break;
+      }
+      default:
+        AT_ERROR("Unsupported operator: ", node->kind().toQualString());
+    }
+    ++node_idx;
+  }
+  const auto return_node = graph->return_node();
+  const auto node_inputs = return_node->inputs();
+  // TODO: tighten the id check for returned tuples.
+  if (return_node->kind() != prim::Return || node_inputs.empty()) {
+    AT_ERROR("Unexpected end of graph");
+  }
+  TensorBatchVector::value_type returned_tuple;
+  XlaComputationInOut::SizeOpValues ret_size_op_values;
+  for (size_t return_input_idx = 0; return_input_idx < node_inputs.size();
+       ++return_input_idx) {
+    const auto return_input = node_inputs[return_input_idx];
+    const auto it = size_op_values.find(return_input->unique());
+    if (it != size_op_values.end()) {
+      const auto it_ok =
+          ret_size_op_values.emplace(return_input_idx, it->second);
+      XLA_CHECK(it_ok.second)
+          << "Duplicated return component index " << return_input_idx;
+    }
+    returned_tuple.push_back(
+        ctx.GetTensorForInput(return_node, return_input_idx));
+  }
+  return {{returned_tuple}, ret_size_op_values};
+}
+
 void XlaModule::SetInputGradientsForFusion(std::vector<at::Tensor> gradients) {
+  if (xla::sys_util::GetEnvInt("XLA_OP_BY_OP", 0)) {
+    AT_ERROR("Not supported for op-by-op mode yet");
+  }
   backward_input_gradients_ = std::move(gradients);
 }
 
@@ -481,7 +895,8 @@ XlaModule::TensorBatchVector XlaModule::RunUnfusedForward(
       GetDataBatchVector(inputs_params_buffers, /*zero_input=*/nullptr);
 
   // Lazy-convert forward graph to XlaComputation.
-  if (forward_computation_ == nullptr) {
+  const bool op_by_op = xla::sys_util::GetEnvInt("XLA_OP_BY_OP", 0);
+  if (forward_computation_ == nullptr && !op_by_op) {
     // Shapes are going to be the same for all replicas, so use the ones of the
     // first replica here.
     std::vector<XlaTranslator::ParameterShape> forward_shapes;
@@ -503,8 +918,17 @@ XlaModule::TensorBatchVector XlaModule::RunUnfusedForward(
         &result_shape);
   }
 
+  const auto op_by_op_result =
+      op_by_op
+          ? ExecuteOpByOp(PrepareForwardInput(inputs), {}, gradient_.f.get())
+          : XlaModule::OpByOpExecutionResult{};
   TensorBatchVector raw_outputs =
-      Execute(*forward_computation_, inputs_params_buffers_data);
+      op_by_op ? op_by_op_result.tensors
+               : Execute(*forward_computation_, inputs_params_buffers_data);
+  if (op_by_op) {
+    backward_size_op_values_ =
+        SetBackwardSizeOpValues(op_by_op_result.ret_size_op_values, gradient_);
+  }
 
   TensorBatchVector outputs;
   for (size_t i = 0; i < raw_outputs.size(); ++i) {

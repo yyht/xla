@@ -27,37 +27,6 @@ xla::ComputationClient* CreateClient() {
   return xla::ComputationClient::Create().ConsumeValueOrDie().release();
 }
 
-xla::XlaOp GetConstantOp(xla::XlaBuilder* builder, Node* node) {
-  auto value = toIValue(node->output()).value();
-  if (value.isTensor()) {
-    auto literal = GetTensorLiteral(value.toTensor(), /*shape=*/nullptr);
-    return xla::ConstantLiteral(builder, literal);
-  } else if (value.isDouble()) {
-    return xla::ConstantR0<float>(builder, value.toDouble());
-  } else if (value.isInt()) {
-    return xla::ConstantR0<xla::int64>(builder, value.toInt());
-  } else if (value.isIntList()) {
-    auto value_list = value.toIntList();
-    std::vector<xla::int64> elements(value_list->elements().begin(),
-                                     value_list->elements().end());
-    return xla::ConstantR1<xla::int64>(builder, elements);
-  } else if (value.isBoolList()) {
-    auto value_list = value.toBoolList();
-    std::vector<xla::int64> elements(value_list->elements().begin(),
-                                     value_list->elements().end());
-    return xla::ConstantR1<xla::int64>(builder, elements);
-  } else if (value.isDoubleList()) {
-    auto value_list = value.toDoubleList();
-    std::vector<float> elements(value_list->elements().begin(),
-                                value_list->elements().end());
-    return xla::ConstantR1<float>(builder, elements);
-  } else if (value.isBool()) {
-    return xla::ConstantR0<bool>(builder, value.toBool());
-  } else {
-    XLA_ERROR() << "Unsupported constant: " << value;
-  }
-}
-
 // Context class to hold together all the necessary state for the XLA
 // computation building process out of a PyTorch graph.
 class ComputationContext {
@@ -163,6 +132,37 @@ class ComputationContext {
 };
 
 }  // namespace
+
+xla::XlaOp GetConstantOp(xla::XlaBuilder* builder, Node* node) {
+  auto value = toIValue(node->output()).value();
+  if (value.isTensor()) {
+    auto literal = GetTensorLiteral(value.toTensor(), /*shape=*/nullptr);
+    return xla::ConstantLiteral(builder, literal);
+  } else if (value.isDouble()) {
+    return xla::ConstantR0<float>(builder, value.toDouble());
+  } else if (value.isInt()) {
+    return xla::ConstantR0<xla::int64>(builder, value.toInt());
+  } else if (value.isIntList()) {
+    auto value_list = value.toIntList();
+    std::vector<xla::int64> elements(value_list->elements().begin(),
+                                     value_list->elements().end());
+    return xla::ConstantR1<xla::int64>(builder, elements);
+  } else if (value.isBoolList()) {
+    auto value_list = value.toBoolList();
+    std::vector<xla::int64> elements(value_list->elements().begin(),
+                                     value_list->elements().end());
+    return xla::ConstantR1<xla::int64>(builder, elements);
+  } else if (value.isDoubleList()) {
+    auto value_list = value.toDoubleList();
+    std::vector<float> elements(value_list->elements().begin(),
+                                value_list->elements().end());
+    return xla::ConstantR1<float>(builder, elements);
+  } else if (value.isBool()) {
+    return xla::ConstantR0<bool>(builder, value.toBool());
+  } else {
+    XLA_ERROR() << "Unsupported constant: " << value;
+  }
+}
 
 xla::ComputationClient* XlaGetClient() {
   static xla::ComputationClient* computation_client = CreateClient();
