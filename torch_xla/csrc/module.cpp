@@ -274,25 +274,41 @@ struct BinaryOpByOpInputs {
   xla::XlaOp xla_rhs;
 };
 
+c10::optional<xla::XlaOp> GetOpByOpConstOp(
+    const size_t id, const std::unordered_map<size_t, Node*>& constant_nodes,
+    const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
+    xla::XlaBuilder* b) {
+  const auto constant_nodes_it = constant_nodes.find(id);
+  if (constant_nodes_it != constant_nodes.end()) {
+    return GetConstantOp(b, constant_nodes_it->second);
+  }
+  const auto zero_node_ids_it = zero_node_ids.find(id);
+  if (zero_node_ids_it != zero_node_ids.end()) {
+    return XlaHelpers::ScalarBroadcast<float>(0, zero_node_ids_it->second, b);
+  }
+  return c10::nullopt;
+}
+
 BinaryOpByOpInputs GetBinaryOpByOpInputs(
     const Node* node, const std::unordered_map<size_t, Node*>& constant_nodes,
+    const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
     const OpByOpContext& ctx, xla::XlaBuilder* b) {
   XLA_CHECK_GE(node->inputs().size(), 2);
-  const auto lhs_const_it = constant_nodes.find(node->input(0)->unique());
-  const auto rhs_const_it = constant_nodes.find(node->input(1)->unique());
-  const auto lhs = lhs_const_it == constant_nodes.end()
-                       ? ctx.GetTensorForInput(node, 0)
-                       : nullptr;
-  const auto rhs = rhs_const_it == constant_nodes.end()
-                       ? ctx.GetTensorForInput(node, 1)
-                       : nullptr;
-  const auto xla_lhs = lhs ? xla::Parameter(b, 0, lhs->shape(), "param_0")
-                           : GetConstantOp(b, lhs_const_it->second);
+  const auto xla_lhs_maybe = GetOpByOpConstOp(node->input(0)->unique(),
+                                              constant_nodes, zero_node_ids, b);
+  const auto xla_rhs_maybe = GetOpByOpConstOp(node->input(1)->unique(),
+                                              constant_nodes, zero_node_ids, b);
+  const auto lhs = xla_lhs_maybe ? nullptr : ctx.GetTensorForInput(node, 0);
+  const auto rhs = xla_rhs_maybe ? nullptr : ctx.GetTensorForInput(node, 1);
+  const auto xla_lhs = xla_lhs_maybe
+                           ? *xla_lhs_maybe
+                           : xla::Parameter(b, 0, lhs->shape(), "param_0");
   size_t second_param_idx = lhs ? 1 : 0;
   const auto xla_rhs =
-      rhs ? xla::Parameter(b, second_param_idx, rhs->shape(),
-                           "param_" + std::to_string(second_param_idx))
-          : GetConstantOp(b, rhs_const_it->second);
+      xla_rhs_maybe
+          ? *xla_rhs_maybe
+          : xla::Parameter(b, second_param_idx, rhs->shape(),
+                           "param_" + std::to_string(second_param_idx));
   return {lhs, rhs, xla_lhs, xla_rhs};
 }
 
@@ -311,25 +327,43 @@ std::vector<XLATensor*> GetBinaryOpByOpTensorOperands(
 }  // namespace
 
 XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
-    const TensorBatchVector& inputs, const std::vector<bool>& zero_input,
+    const TensorBatchVector& inputs,
+    const XlaComputationInOut::SizeOpValues& param_size_op_values,
+    const std::vector<XlaTranslator::ParameterShape>& param_shapes,
     Graph* graph) {
   const auto graph_inputs = graph->inputs();
-  XLA_CHECK((zero_input.empty() && graph_inputs.size() == inputs[0].size()) ||
-            (zero_input.size() == graph_inputs.size()))
-      << "Graph:\n"
-      << graph->toString();
+  XLA_CHECK_EQ(param_shapes.size(), graph_inputs.size()) << "Graph:\n"
+                                                         << graph->toString();
   // TODO(asuhan)
   XLA_CHECK_EQ(inputs.size(), 1)
       << "Op-by-op not supported in replicated mode yet";
   auto nodes = graph->block()->nodes();
   OpByOpContext ctx;
+  size_t input_number = 0;
+  XlaComputationInOut::SizeOpValues size_op_values;
+  std::unordered_map<size_t, xla::Shape> zero_node_ids;
   for (size_t parameter_number = 0; parameter_number < graph_inputs.size();
        ++parameter_number) {
+    Value* graph_input = graph_inputs[parameter_number];
+    // Seed aten::size tracking info with the values in param_size_op_values.
+    const auto size_op_value_it = param_size_op_values.find(parameter_number);
+    if (size_op_value_it != param_size_op_values.end()) {
+      const auto it_ok = size_op_values.emplace(graph_input->unique(),
+                                                size_op_value_it->second);
+      XLA_CHECK(it_ok.second)
+          << "Duplicated aten::size id" << graph_input->unique();
+    }
+    if (param_shapes[parameter_number].kind ==
+        XlaTranslator::ParameterKind::kZeroInput) {
+      const auto it_ok = zero_node_ids.emplace(
+          graph_input->unique(), param_shapes[parameter_number].shape);
+      XLA_CHECK(it_ok.second);
+      continue;
+    }
     ctx.AddTensorForId(graph_inputs[parameter_number]->unique(),
-                       inputs[0][parameter_number]);
+                       inputs[0][input_number++]);
   }
   size_t node_idx = 0;
-  XlaComputationInOut::SizeOpValues size_op_values;
   std::unordered_map<size_t, Node*> constant_nodes;
   for (const auto node : nodes) {
     xla::XlaBuilder b("node_" + std::to_string(node_idx));
@@ -339,11 +373,12 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
       case aten::sub:
       case aten::mul: {
         const auto binary_op_by_op_inputs =
-            GetBinaryOpByOpInputs(node, constant_nodes, ctx, &b);
+            GetBinaryOpByOpInputs(node, constant_nodes, zero_node_ids, ctx, &b);
         xla::PrecisionConfig precision_config =
             XlaHelpers::BuildPrecisionConfig(GetPrecisionConfig());
-        BuildArithmeticOp(node, binary_op_by_op_inputs.xla_lhs,
-                          binary_op_by_op_inputs.xla_rhs);
+        auto promoted = XlaHelpers::PromoteValues(
+            binary_op_by_op_inputs.xla_lhs, binary_op_by_op_inputs.xla_rhs);
+        BuildArithmeticOp(node, promoted.first, promoted.second);
         const auto operands =
             GetBinaryOpByOpTensorOperands(binary_op_by_op_inputs);
         DispatchOneOp(node, operands, inputs, &ctx, &b, this);
@@ -376,6 +411,24 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         }
         break;
       }
+      case aten::thnn_conv2d_backward: {
+        XLA_CHECK_EQ(node->inputs().size(), 9);
+        const auto grad = ctx.GetTensorForInput(node, 0);
+        const auto xla_grad = xla::Parameter(&b, 0, grad->shape(), "param_0");
+        const auto input = ctx.GetTensorForInput(node, 1);
+        const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
+        const auto weight = ctx.GetTensorForInput(node, 2);
+        const auto xla_weight =
+            xla::Parameter(&b, 2, weight->shape(), "param_2");
+        const auto conv2d_grads = BuildConv2dBackward(
+            node, xla_grad, xla_input, xla_weight, GetPrecisionConfig());
+        XlaHelpers::CreateReturnValue(
+            &b, {conv2d_grads.grad_input, conv2d_grads.grad_weight,
+                 conv2d_grads.grad_bias});
+        DispatchOneOp(node, {grad.get(), input.get(), weight.get()}, inputs,
+                      &ctx, &b, this);
+        break;
+      }
       case aten::t: {
         XLA_CHECK_EQ(node->inputs().size(), 1);
         const auto input = ctx.GetTensorForInput(node, 0);
@@ -386,7 +439,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
       }
       case aten::mm: {
         const auto binary_op_by_op_inputs =
-            GetBinaryOpByOpInputs(node, constant_nodes, ctx, &b);
+            GetBinaryOpByOpInputs(node, constant_nodes, zero_node_ids, ctx, &b);
         xla::PrecisionConfig precision_config =
             XlaHelpers::BuildPrecisionConfig(GetPrecisionConfig());
         xla::Dot(binary_op_by_op_inputs.xla_lhs, binary_op_by_op_inputs.xla_rhs,
@@ -405,11 +458,43 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
         break;
       }
+      case aten::max_pool2d_with_indices_backward: {
+        XLA_CHECK_EQ(node->inputs().size(), 8);
+        const auto out_backprop = ctx.GetTensorForInput(node, 0);
+        const auto xla_out_backprop =
+            xla::Parameter(&b, 0, out_backprop->shape(), "param_0");
+        const auto input = ctx.GetTensorForInput(node, 1);
+        const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
+        BuildMaxPool2dBackward(node, xla_out_backprop, xla_input);
+        DispatchOneOp(node, {out_backprop.get(), input.get()}, inputs, &ctx, &b,
+                      this);
+        break;
+      }
       case aten::avg_pool2d: {
         XLA_CHECK_GE(node->inputs().size(), 1);
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildAvgPool2d(node, xla_input);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::avg_pool2d_backward: {
+        XLA_CHECK_GE(node->inputs().size(), 2);
+        const auto out_backprop = ctx.GetTensorForInput(node, 0);
+        const auto xla_grad_output =
+            xla::Parameter(&b, 0, out_backprop->shape(), "param_0");
+        const auto input = ctx.GetTensorForInput(node, 1);
+        const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
+        BuildAvgPool2dBackward(node, xla_grad_output, xla_input);
+        DispatchOneOp(node, {out_backprop.get(), input.get()}, inputs, &ctx, &b,
+                      this);
+        break;
+      }
+      case aten::neg: {
+        XLA_CHECK_EQ(node->inputs().size(), 1);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        Neg(xla_input);
         DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
         break;
       }
@@ -422,7 +507,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         break;
       }
       case aten::sigmoid: {
-        CHECK_EQ(node->inputs().size(), 1);
+        XLA_CHECK_EQ(node->inputs().size(), 1);
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         const auto half = XlaHelpers::ScalarValue<float>(
@@ -456,12 +541,39 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
                       this);
         break;
       }
+      case aten::threshold_backward: {
+        XLA_CHECK_EQ(node->inputs().size(), 3);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto output = ctx.GetTensorForInput(node, 1);
+        const auto xla_output =
+            xla::Parameter(&b, 0, output->shape(), "param_0");
+        const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
+        BuildThreshold(
+            node, xla_output, xla_input,
+            node->get<at::Scalar>(attr::threshold).value().to<float>(), 0, &b);
+        DispatchOneOp(node, {output.get(), input.get()}, inputs, &ctx, &b,
+                      this);
+        break;
+      }
       case aten::log_softmax: {
         XLA_CHECK_EQ(node->inputs().size(), size_t(2));
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildLogSoftmax(node, xla_input);
         DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        break;
+      }
+      case aten::_log_softmax_backward_data: {
+        XLA_CHECK_EQ(node->inputs().size(), 4);
+        const auto grad_output = ctx.GetTensorForInput(node, 0);
+        const auto xla_grad_output =
+            xla::Parameter(&b, 0, grad_output->shape(), "param_0");
+        const auto output = ctx.GetTensorForInput(node, 1);
+        const auto xla_output =
+            xla::Parameter(&b, 1, output->shape(), "param_1");
+        BuildLogSoftmaxGrad(node, xla_grad_output, xla_output);
+        DispatchOneOp(node, {grad_output.get(), output.get()}, inputs, &ctx, &b,
+                      this);
         break;
       }
       case aten::reshape:
@@ -527,6 +639,34 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
                       &ctx, &b, this);
         break;
       }
+      case aten::native_batch_norm_backward: {
+        XLA_CHECK_EQ(node->inputs().size(), 10);
+        const auto grad = ctx.GetTensorForInput(node, 0);
+        const auto input = ctx.GetTensorForInput(node, 1);
+        const auto weight = ctx.GetTensorForInput(node, 2);
+        const auto save_mean = ctx.GetTensorForInput(node, 5);
+        const auto save_invstd_eps = ctx.GetTensorForInput(node, 6);
+        const auto xla_grad = xla::Parameter(&b, 0, grad->shape(), "param_0");
+        const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
+        const auto xla_weight =
+            xla::Parameter(&b, 2, weight->shape(), "param_2");
+        const auto xla_save_mean =
+            xla::Parameter(&b, 3, save_mean->shape(), "param_3");
+        const auto xla_save_invstd_eps =
+            xla::Parameter(&b, 4, save_invstd_eps->shape(), "param_4");
+        auto grads = BuildBatchNormBackward(node, xla_grad,  // grad_output
+                                            xla_input,       // input
+                                            xla_weight,      // weight
+                                            xla_save_mean,   // save_mean
+                                            xla_save_invstd_eps);  // save_std
+        XlaHelpers::CreateReturnValue(
+            &b, {grads.grad_input, grads.grad_weight, grads.grad_bias});
+        DispatchOneOp(node,
+                      {grad.get(), input.get(), weight.get(), save_mean.get(),
+                       save_invstd_eps.get()},
+                      inputs, &ctx, &b, this);
+        break;
+      }
       case aten::sum: {
         XLA_CHECK_GE(node->inputs().size(), 1);
         const auto input = ctx.GetTensorForInput(node, 0);
@@ -544,6 +684,19 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto xla_labels =
             xla::Parameter(&b, 1, labels->shape(), "param_1");
         BuildNllLoss(node, xla_logits, xla_labels);
+        DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b,
+                      this);
+        break;
+      }
+      case aten::nll_loss_backward: {
+        XLA_CHECK_EQ(node->inputs().size(), 7);
+        const auto logits = ctx.GetTensorForInput(node, 1);
+        const auto xla_logits =
+            xla::Parameter(&b, 0, logits->shape(), "param_0");
+        const auto labels = ctx.GetTensorForInput(node, 2);
+        const auto xla_labels =
+            xla::Parameter(&b, 1, labels->shape(), "param_1");
+        BuildNllLossBackward(node, xla_logits, xla_labels);
         DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b,
                       this);
         break;
@@ -573,6 +726,14 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
       }
       case prim::Undefined: {
         ctx.AddUndefinedInput(node->output(0)->unique());
+        break;
+      }
+      case prim::SumToSize: {
+        XLA_CHECK_EQ(node->inputs().size(), 2);
+        const auto input = ctx.GetTensorForInput(node, 0);
+        const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
+        BuildSumToSize(node, xla_input, size_op_values);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
         break;
       }
       default:
@@ -670,20 +831,20 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
     }
     raw_grad_outputs.push_back(std::move(replica_raw_grad_outputs));
   }
+  const bool op_by_op = xla::sys_util::GetEnvInt("XLA_OP_BY_OP", 0);
+  // The shape for all the replicas are the same, so use replica[0] for
+  // building the shapes vector for the BuildComputation() call.
+  const auto& replica_raw_grad_outputs = raw_grad_outputs.front();
+  std::vector<XlaTranslator::ParameterShape> backward_shapes;
+  for (size_t j = 0; j < replica_raw_grad_outputs.size(); ++j) {
+    XlaTranslator::ParameterKind kind =
+        zero_input[j] ? XlaTranslator::ParameterKind::kZeroInput
+                      : XlaTranslator::ParameterKind::kGraphInput;
+    backward_shapes.push_back(XlaTranslator::ParameterShape(
+        replica_raw_grad_outputs[j]->shape(), kind));
+  }
   // If backward graph is not compiled, compile it.
-  if (backward_computation_ == nullptr) {
-    // The shape for all the replicas are the same, so use replica[0] for
-    // building the shapes vector for the BuildComputation() call.
-    const auto& replica_raw_grad_outputs = raw_grad_outputs.front();
-    std::vector<XlaTranslator::ParameterShape> backward_shapes;
-    for (size_t j = 0; j < replica_raw_grad_outputs.size(); ++j) {
-      XlaTranslator::ParameterKind kind =
-          zero_input[j] ? XlaTranslator::ParameterKind::kZeroInput
-                        : XlaTranslator::ParameterKind::kGraphInput;
-      backward_shapes.push_back(XlaTranslator::ParameterShape(
-          replica_raw_grad_outputs[j]->shape(), kind));
-    }
-
+  if (backward_computation_ == nullptr && !op_by_op) {
     XlaTranslator xla_bwd_impl(gradient_.df, GetPrecisionConfig());
     xla::XlaComputation computation =
         xla_bwd_impl
@@ -699,8 +860,15 @@ void XlaModule::backward(const TensorBatchVector& grad_outputs) {
   DataBatchVector raw_grad_outputs_data =
       GetDataBatchVector(raw_grad_outputs, &zero_input);
 
+  const auto op_by_op_result =
+      op_by_op
+          ? ExecuteOpByOp(GetTensorBatchVector(raw_grad_outputs, &zero_input),
+                          backward_size_op_values_, backward_shapes,
+                          gradient_.df.get())
+          : XlaModule::OpByOpExecutionResult{};
   TensorBatchVector grad_inputs =
-      Execute(*backward_computation_, raw_grad_outputs_data);
+      op_by_op ? op_by_op_result.tensors
+               : Execute(*backward_computation_, raw_grad_outputs_data);
 
   ApplyGradients(grad_inputs, inputs_, optimizable_params_,
                  inputs_require_grad_, *gradient_.df);
@@ -896,15 +1064,14 @@ XlaModule::TensorBatchVector XlaModule::RunUnfusedForward(
 
   // Lazy-convert forward graph to XlaComputation.
   const bool op_by_op = xla::sys_util::GetEnvInt("XLA_OP_BY_OP", 0);
+  // Shapes are going to be the same for all replicas, so use the ones of the
+  // first replica here.
+  std::vector<XlaTranslator::ParameterShape> forward_shapes;
+  for (auto p : inputs_params_buffers.front()) {
+    forward_shapes.push_back(XlaTranslator::ParameterShape(
+        p->shape(), XlaTranslator::ParameterKind::kGraphInput));
+  }
   if (forward_computation_ == nullptr && !op_by_op) {
-    // Shapes are going to be the same for all replicas, so use the ones of the
-    // first replica here.
-    std::vector<XlaTranslator::ParameterShape> forward_shapes;
-    for (auto p : inputs_params_buffers.front()) {
-      forward_shapes.push_back(XlaTranslator::ParameterShape(
-          p->shape(), XlaTranslator::ParameterKind::kGraphInput));
-    }
-
     XlaTranslator xla_fwd_impl(gradient_.f, GetPrecisionConfig());
     auto forward_translation_result = xla_fwd_impl.BuildComputation(
         "XlaForward", forward_shapes, backward_size_op_values_);
@@ -919,9 +1086,9 @@ XlaModule::TensorBatchVector XlaModule::RunUnfusedForward(
   }
 
   const auto op_by_op_result =
-      op_by_op
-          ? ExecuteOpByOp(PrepareForwardInput(inputs), {}, gradient_.f.get())
-          : XlaModule::OpByOpExecutionResult{};
+      op_by_op ? ExecuteOpByOp(PrepareForwardInput(inputs), {}, forward_shapes,
+                               gradient_.f.get())
+               : XlaModule::OpByOpExecutionResult{};
   TensorBatchVector raw_outputs =
       op_by_op ? op_by_op_result.tensors
                : Execute(*forward_computation_, inputs_params_buffers_data);
@@ -1091,6 +1258,21 @@ XlaModule::DataBatchVector XlaModule::GetDataBatchVector(
     inputs_data.push_back(std::move(replica_inputs_data));
   }
   return inputs_data;
+}
+
+XlaModule::TensorBatchVector XlaModule::GetTensorBatchVector(
+    const TensorBatchVector& inputs, const std::vector<bool>* zero_input) {
+  TensorBatchVector non_zero_inputs;
+  for (auto& replica_inputs : inputs) {
+    TensorBatchVector::value_type replica_non_zero_inputs;
+    for (size_t j = 0; j < replica_inputs.size(); ++j) {
+      if (zero_input == nullptr || !zero_input->at(j)) {
+        replica_non_zero_inputs.push_back(replica_inputs[j]);
+      }
+    }
+    non_zero_inputs.push_back(std::move(replica_non_zero_inputs));
+  }
+  return non_zero_inputs;
 }
 
 std::vector<XLATensor::Device> XlaModule::CommonDevicesForReplicas(

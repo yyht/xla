@@ -136,6 +136,9 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   static DataBatchVector GetDataBatchVector(
       const TensorBatchVector& inputs, const std::vector<bool>* zero_input);
 
+  static TensorBatchVector GetTensorBatchVector(
+      const TensorBatchVector& inputs, const std::vector<bool>* zero_input);
+
   // Returns the common device for every replica copy of the inputs.
   // All common devices must be different in different replicas.
   static std::vector<XLATensor::Device> CommonDevicesForReplicas(
@@ -146,9 +149,11 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
     XlaComputationInOut::SizeOpValues ret_size_op_values;
   };
 
-  OpByOpExecutionResult ExecuteOpByOp(const TensorBatchVector& inputs,
-                                      const std::vector<bool>& zero_input,
-                                      Graph* graph);
+  OpByOpExecutionResult ExecuteOpByOp(
+      const TensorBatchVector& inputs,
+      const XlaComputationInOut::SizeOpValues& param_size_op_values,
+      const std::vector<XlaTranslator::ParameterShape>& param_shapes,
+      Graph* graph);
 
   // The devices where the replicas should be running. Replica 'i' on
   // devices_[i].
