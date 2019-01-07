@@ -203,55 +203,24 @@ XlaModule::TensorBatchVector XlaModule::forward(
   return RunUnfusedForward(inputs);
 }
 
-namespace {
-
-class OpByOpContext {
- public:
-  std::shared_ptr<XLATensor> GetTensorForInput(const Node* node,
-                                               size_t input_index) const {
-    const auto input = node->input(input_index);
-    auto it = node_tensors_.find(input->unique());
-    XLA_CHECK(it != node_tensors_.end())
-        << "Input " << input_index << " of " << *node << " not found";
-    return it->second;
+void XlaModule::DispatchOneOp(const Node* node,
+                              const std::vector<XLATensor*>& operands,
+                              const XlaModule::TensorBatchVector& inputs,
+                              XlaModule::OpByOpContext* ctx,
+                              xla::XlaBuilder* b) {
+  std::shared_ptr<xla::ComputationClient::Computation> computation;
+  const auto cache_it = op_by_op_compilation_cache_.find(node);
+  if (cache_it == op_by_op_compilation_cache_.end()) {
+    auto xla_computation = b->Build().ValueOrDie();
+    xla::Shape result_shape =
+        XlaModule::GetResultShape(xla_computation, inputs);
+    computation = XlaGetClient()->Compile(std::move(xla_computation),
+                                          GetStringDevices(), &result_shape);
+    const auto it_ok = op_by_op_compilation_cache_.emplace(node, computation);
+    XLA_CHECK(it_ok.second);
+  } else {
+    computation = cache_it->second;
   }
-
-  std::shared_ptr<XLATensor> GetTensorForId(size_t id) const {
-    auto it = node_tensors_.find(id);
-    XLA_CHECK(it != node_tensors_.end())
-        << "Node with id " << id << " not found";
-    return it->second;
-  }
-
-  c10::optional<std::shared_ptr<XLATensor>> GetTensorForInputMaybe(
-      const Node* node, size_t input_index) const {
-    const auto input = node->input(input_index);
-    if (undefined_inputs_.find(input->unique()) != undefined_inputs_.end()) {
-      return c10::nullopt;
-    }
-    return GetTensorForId(input->unique());
-  }
-
-  void AddTensorForId(const size_t id, std::shared_ptr<XLATensor> tensor) {
-    const auto it_ok = node_tensors_.emplace(id, tensor);
-    XLA_CHECK(it_ok.second) << "Duplicated tensor id " << id;
-  }
-
-  void AddUndefinedInput(size_t index) { undefined_inputs_.insert(index); }
-
- private:
-  std::unordered_map<size_t, std::shared_ptr<XLATensor>> node_tensors_;
-  std::unordered_set<size_t> undefined_inputs_;
-};
-
-void DispatchOneOp(const Node* node, const std::vector<XLATensor*>& operands,
-                   const XlaModule::TensorBatchVector& inputs,
-                   OpByOpContext* ctx, xla::XlaBuilder* b,
-                   const XlaModule* module) {
-  auto xla_computation = b->Build().ValueOrDie();
-  xla::Shape result_shape = XlaModule::GetResultShape(xla_computation, inputs);
-  const auto computation = XlaGetClient()->Compile(
-      std::move(xla_computation), module->GetStringDevices(), &result_shape);
   std::vector<xla::ComputationClient::Data*> arguments;
   for (const auto operand : operands) {
     arguments.push_back(operand->CurrentXlaData().get());
@@ -267,29 +236,7 @@ void DispatchOneOp(const Node* node, const std::vector<XLATensor*>& operands,
   }
 }
 
-struct BinaryOpByOpInputs {
-  std::shared_ptr<XLATensor> lhs;
-  std::shared_ptr<XLATensor> rhs;
-  xla::XlaOp xla_lhs;
-  xla::XlaOp xla_rhs;
-};
-
-c10::optional<xla::XlaOp> GetOpByOpConstOp(
-    const size_t id, const std::unordered_map<size_t, Node*>& constant_nodes,
-    const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
-    xla::XlaBuilder* b) {
-  const auto constant_nodes_it = constant_nodes.find(id);
-  if (constant_nodes_it != constant_nodes.end()) {
-    return GetConstantOp(b, constant_nodes_it->second);
-  }
-  const auto zero_node_ids_it = zero_node_ids.find(id);
-  if (zero_node_ids_it != zero_node_ids.end()) {
-    return XlaHelpers::ScalarBroadcast<float>(0, zero_node_ids_it->second, b);
-  }
-  return c10::nullopt;
-}
-
-BinaryOpByOpInputs GetBinaryOpByOpInputs(
+XlaModule::BinaryOpByOpInputs XlaModule::GetBinaryOpByOpInputs(
     const Node* node, const std::unordered_map<size_t, Node*>& constant_nodes,
     const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
     const OpByOpContext& ctx, xla::XlaBuilder* b) {
@@ -312,7 +259,22 @@ BinaryOpByOpInputs GetBinaryOpByOpInputs(
   return {lhs, rhs, xla_lhs, xla_rhs};
 }
 
-std::vector<XLATensor*> GetBinaryOpByOpTensorOperands(
+c10::optional<xla::XlaOp> XlaModule::GetOpByOpConstOp(
+    const size_t id, const std::unordered_map<size_t, Node*>& constant_nodes,
+    const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
+    xla::XlaBuilder* b) {
+  const auto constant_nodes_it = constant_nodes.find(id);
+  if (constant_nodes_it != constant_nodes.end()) {
+    return GetConstantOp(b, constant_nodes_it->second);
+  }
+  const auto zero_node_ids_it = zero_node_ids.find(id);
+  if (zero_node_ids_it != zero_node_ids.end()) {
+    return XlaHelpers::ScalarBroadcast<float>(0, zero_node_ids_it->second, b);
+  }
+  return c10::nullopt;
+}
+
+std::vector<XLATensor*> XlaModule::GetBinaryOpByOpTensorOperands(
     const BinaryOpByOpInputs& binary_op_by_op_inputs) {
   std::vector<XLATensor*> operands;
   if (binary_op_by_op_inputs.lhs) {
@@ -323,8 +285,6 @@ std::vector<XLATensor*> GetBinaryOpByOpTensorOperands(
   }
   return operands;
 }
-
-}  // namespace
 
 XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
     const TensorBatchVector& inputs,
@@ -381,7 +341,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         BuildArithmeticOp(node, promoted.first, promoted.second);
         const auto operands =
             GetBinaryOpByOpTensorOperands(binary_op_by_op_inputs);
-        DispatchOneOp(node, operands, inputs, &ctx, &b, this);
+        DispatchOneOp(node, operands, inputs, &ctx, &b);
         break;
       }
       case aten::convolution:
@@ -403,11 +363,10 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
           BuildConvolutionBias(node, xla_input, xla_kernel, xla_bias,
                                GetPrecisionConfig());
           DispatchOneOp(node, {input.get(), kernel.get(), bias.get()}, inputs,
-                        &ctx, &b, this);
+                        &ctx, &b);
         } else {
           BuildConvolution(node, xla_input, xla_kernel, GetPrecisionConfig());
-          DispatchOneOp(node, {input.get(), kernel.get()}, inputs, &ctx, &b,
-                        this);
+          DispatchOneOp(node, {input.get(), kernel.get()}, inputs, &ctx, &b);
         }
         break;
       }
@@ -426,7 +385,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
             &b, {conv2d_grads.grad_input, conv2d_grads.grad_weight,
                  conv2d_grads.grad_bias});
         DispatchOneOp(node, {grad.get(), input.get(), weight.get()}, inputs,
-                      &ctx, &b, this);
+                      &ctx, &b);
         break;
       }
       case aten::t: {
@@ -434,7 +393,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         xla::Transpose(xla_input, {1, 0});
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::mm: {
@@ -446,7 +405,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
                  &precision_config);
         const auto operands =
             GetBinaryOpByOpTensorOperands(binary_op_by_op_inputs);
-        DispatchOneOp(node, operands, inputs, &ctx, &b, this);
+        DispatchOneOp(node, operands, inputs, &ctx, &b);
         break;
       }
       case aten::max_pool2d_with_indices: {
@@ -455,7 +414,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildMaxPool2d(node, xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::max_pool2d_with_indices_backward: {
@@ -466,8 +425,8 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 1);
         const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
         BuildMaxPool2dBackward(node, xla_out_backprop, xla_input);
-        DispatchOneOp(node, {out_backprop.get(), input.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {out_backprop.get(), input.get()}, inputs, &ctx,
+                      &b);
         break;
       }
       case aten::avg_pool2d: {
@@ -475,7 +434,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildAvgPool2d(node, xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::avg_pool2d_backward: {
@@ -486,8 +445,8 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 1);
         const auto xla_input = xla::Parameter(&b, 1, input->shape(), "param_1");
         BuildAvgPool2dBackward(node, xla_grad_output, xla_input);
-        DispatchOneOp(node, {out_backprop.get(), input.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {out_backprop.get(), input.get()}, inputs, &ctx,
+                      &b);
         break;
       }
       case aten::neg: {
@@ -495,7 +454,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         Neg(xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::tanh: {
@@ -503,7 +462,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         Tanh(xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::sigmoid: {
@@ -513,7 +472,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto half = XlaHelpers::ScalarValue<float>(
             0.5, input->shape().element_type(), &b);
         xla::XlaOp xla_output = half + half * Tanh(half * xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::relu: {
@@ -523,7 +482,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         xla::Shape xla_input_shape = XlaHelpers::ShapeOfXlaOp(xla_input);
         xla::Max(xla_input, XlaHelpers::ScalarValue<float>(
                                 0, xla_input_shape.element_type(), &b));
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::threshold: {
@@ -537,8 +496,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
             node, xla_input, xla_output,
             node->get<at::Scalar>(attr::threshold).value().to<float>(),
             node->get<at::Scalar>(attr::value).value().to<float>(), &b);
-        DispatchOneOp(node, {input.get(), output.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {input.get(), output.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::threshold_backward: {
@@ -551,8 +509,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         BuildThreshold(
             node, xla_output, xla_input,
             node->get<at::Scalar>(attr::threshold).value().to<float>(), 0, &b);
-        DispatchOneOp(node, {output.get(), input.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {output.get(), input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::log_softmax: {
@@ -560,7 +517,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildLogSoftmax(node, xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::_log_softmax_backward_data: {
@@ -572,8 +529,8 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto xla_output =
             xla::Parameter(&b, 1, output->shape(), "param_1");
         BuildLogSoftmaxGrad(node, xla_grad_output, xla_output);
-        DispatchOneOp(node, {grad_output.get(), output.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {grad_output.get(), output.get()}, inputs, &ctx,
+                      &b);
         break;
       }
       case aten::reshape:
@@ -582,7 +539,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildView(node, xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::expand: {
@@ -590,7 +547,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildExpand(node, xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::stack: {
@@ -617,7 +574,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         for (const auto& operand : operands_owned) {
           operands.push_back(operand.get());
         }
-        DispatchOneOp(node, operands, inputs, &ctx, &b, this);
+        DispatchOneOp(node, operands, inputs, &ctx, &b);
         break;
       }
       case aten::native_batch_norm:
@@ -636,7 +593,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
             &b, {batch_norm_output.output, batch_norm_output.save_mean,
                  batch_norm_output.save_invstd_eps});
         DispatchOneOp(node, {input.get(), weight.get(), bias.get()}, inputs,
-                      &ctx, &b, this);
+                      &ctx, &b);
         break;
       }
       case aten::native_batch_norm_backward: {
@@ -664,7 +621,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         DispatchOneOp(node,
                       {grad.get(), input.get(), weight.get(), save_mean.get(),
                        save_invstd_eps.get()},
-                      inputs, &ctx, &b, this);
+                      inputs, &ctx, &b);
         break;
       }
       case aten::sum: {
@@ -672,7 +629,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildSum(node, xla_input);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::nll_loss: {
@@ -684,8 +641,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto xla_labels =
             xla::Parameter(&b, 1, labels->shape(), "param_1");
         BuildNllLoss(node, xla_logits, xla_labels);
-        DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::nll_loss_backward: {
@@ -697,8 +653,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto xla_labels =
             xla::Parameter(&b, 1, labels->shape(), "param_1");
         BuildNllLossBackward(node, xla_logits, xla_labels);
-        DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b,
-                      this);
+        DispatchOneOp(node, {logits.get(), labels.get()}, inputs, &ctx, &b);
         break;
       }
       case aten::size: {
@@ -711,7 +666,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
             size_op_values.emplace(node->output(0)->unique(), size_op_result);
         XLA_CHECK(it_ok.second)
             << "Duplicated aten::size id: " << node->output(0)->uniqueName();
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       case prim::Constant: {
@@ -733,7 +688,7 @@ XlaModule::OpByOpExecutionResult XlaModule::ExecuteOpByOp(
         const auto input = ctx.GetTensorForInput(node, 0);
         const auto xla_input = xla::Parameter(&b, 0, input->shape(), "param_0");
         BuildSumToSize(node, xla_input, size_op_values);
-        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b, this);
+        DispatchOneOp(node, {input.get()}, inputs, &ctx, &b);
         break;
       }
       default:

@@ -3,6 +3,7 @@
 #include <initializer_list>
 
 #include "tensor.h"
+#include "tensorflow/compiler/xla/xla_client/debug_macros.h"
 #include "torch/csrc/autograd/variable.h"
 #include "torch/csrc/jit/script/module.h"
 #include "torch/csrc/utils/disallow_copy.h"
@@ -155,6 +156,69 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
       const std::vector<XlaTranslator::ParameterShape>& param_shapes,
       Graph* graph);
 
+  class OpByOpContext {
+   public:
+    std::shared_ptr<XLATensor> GetTensorForInput(const Node* node,
+                                                 size_t input_index) const {
+      const auto input = node->input(input_index);
+      auto it = node_tensors_.find(input->unique());
+      XLA_CHECK(it != node_tensors_.end())
+          << "Input " << input_index << " of " << *node << " not found";
+      return it->second;
+    }
+
+    std::shared_ptr<XLATensor> GetTensorForId(size_t id) const {
+      auto it = node_tensors_.find(id);
+      XLA_CHECK(it != node_tensors_.end())
+          << "Node with id " << id << " not found";
+      return it->second;
+    }
+
+    c10::optional<std::shared_ptr<XLATensor>> GetTensorForInputMaybe(
+        const Node* node, size_t input_index) const {
+      const auto input = node->input(input_index);
+      if (undefined_inputs_.find(input->unique()) != undefined_inputs_.end()) {
+        return c10::nullopt;
+      }
+      return GetTensorForId(input->unique());
+    }
+
+    void AddTensorForId(const size_t id, std::shared_ptr<XLATensor> tensor) {
+      const auto it_ok = node_tensors_.emplace(id, tensor);
+      XLA_CHECK(it_ok.second) << "Duplicated tensor id " << id;
+    }
+
+    void AddUndefinedInput(size_t index) { undefined_inputs_.insert(index); }
+
+   private:
+    std::unordered_map<size_t, std::shared_ptr<XLATensor>> node_tensors_;
+    std::unordered_set<size_t> undefined_inputs_;
+  };
+
+  void DispatchOneOp(const Node* node, const std::vector<XLATensor*>& operands,
+                     const XlaModule::TensorBatchVector& inputs,
+                     OpByOpContext* ctx, xla::XlaBuilder* b);
+
+  struct BinaryOpByOpInputs {
+    std::shared_ptr<XLATensor> lhs;
+    std::shared_ptr<XLATensor> rhs;
+    xla::XlaOp xla_lhs;
+    xla::XlaOp xla_rhs;
+  };
+
+  static BinaryOpByOpInputs GetBinaryOpByOpInputs(
+      const Node* node, const std::unordered_map<size_t, Node*>& constant_nodes,
+      const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
+      const OpByOpContext& ctx, xla::XlaBuilder* b);
+
+  static c10::optional<xla::XlaOp> GetOpByOpConstOp(
+      const size_t id, const std::unordered_map<size_t, Node*>& constant_nodes,
+      const std::unordered_map<size_t, xla::Shape>& zero_node_ids,
+      xla::XlaBuilder* b);
+
+  static std::vector<XLATensor*> GetBinaryOpByOpTensorOperands(
+      const BinaryOpByOpInputs& binary_op_by_op_inputs);
+
   // The devices where the replicas should be running. Replica 'i' on
   // devices_[i].
   std::vector<XLATensor::Device> devices_;
@@ -198,6 +262,10 @@ struct XlaModule : public std::enable_shared_from_this<XlaModule> {
   // Keep the script module alive for lazy initialization of this XlaModule.
   // Once this XlaModule is initialized, script_module_ will be set to null.
   std::shared_ptr<script::Module> script_module_;
+
+  std::unordered_map<const Node*,
+                     std::shared_ptr<xla::ComputationClient::Computation>>
+      op_by_op_compilation_cache_;
 };
 
 }  // namespace jit
