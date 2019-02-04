@@ -23,6 +23,7 @@
 #include "ops/ops.h"
 #include "ops/scalar.h"
 #include "ops/softmax.h"
+#include "ops/softmax_backward.h"
 #include "ops/threshold.h"
 #include "ops/view.h"
 #include "tensor_util.h"
@@ -635,6 +636,15 @@ std::tuple<XLATensor, XLATensor, XLATensor> XLATensor::conv2d_backward(
   XLATensor grad_bias =
       Create(ir::NodeOperand(node, 2), out_backprop.GetDevice());
   return {std::move(grad_input), std::move(grad_weight), std::move(grad_bias)};
+}
+
+XLATensor XLATensor::log_softmax_backward(const XLATensor& grad_output,
+                                          const XLATensor& output,
+                                          xla::int64 dim) {
+  return Create(ir::NodeOperand(std::make_shared<ir::ops::LogSoftmaxBackward>(
+                    ir::NodeOperand(grad_output.GetIrNode()),
+                    ir::NodeOperand(output.GetIrNode()), dim)),
+                grad_output.GetDevice());
 }
 
 XLATensor XLATensor::t() const {
